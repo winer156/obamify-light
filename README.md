@@ -5,7 +5,7 @@ revolutionary new technology that turns any image into obama
 
 # How to use
 
-**Use the ui at the top of the window to control the animation, choose between saved transformations, and generate new ones.** All your transformations are saved in the `presets` folder next to the executable. I have no idea why you would ever want to do this, but if you want the program to transform your images to something other than obama, you can change the `target.png` and `weights.png` files in the same directory.
+**Use the ui at the top of the window to control the animation, choose between saved transformations, and generate new ones.** All your transformations are saved in the `presets` folder next to the executable. I have no idea why you would ever want to do this, but if you want to transform your images to something other than obama, you can change the `target.png` and `weights.png` files in the same directory.
 
 > `weights.png` is a grayscale image that decides how much importance is given to that pixel being accurate in the final image.
 > `target.png` is the image that you want to transform your source image into.
@@ -13,7 +13,7 @@ revolutionary new technology that turns any image into obama
 
 # Installations
 
-Install the latest version in [releases](https://github.com/Spu7Nix/obamify/releases) (windows only atm)
+Install the latest version in [releases](https://github.com/Spu7Nix/obamify/releases) (windows only atm). Unzip and run the .exe file inside!
 
 ### Building from source
 
