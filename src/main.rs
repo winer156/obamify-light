@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod morph_sim;
 use std::{
     num::NonZeroU64,
@@ -984,9 +986,8 @@ impl VoronoiApp {
 }
 
 fn get_presets() -> Vec<PathBuf> {
-    std::fs::read_dir("./presets")
-        .unwrap()
-        .filter_map(|entry| {
+    if let Ok(dir) = std::fs::read_dir("./presets") {
+        dir.filter_map(|entry| {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 Some(path)
@@ -995,6 +996,9 @@ fn get_presets() -> Vec<PathBuf> {
             }
         })
         .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn div_up(n: u32, d: u32) -> u32 {
@@ -1106,8 +1110,12 @@ impl App for VoronoiApp {
                         std::thread::spawn({
                             let tx = self.progress_tx.clone();
                             let cancelled = self.process_cancelled.clone();
-                            move || {
-                                calculate::process(path, settings, tx, cancelled);
+                            move || match calculate::process(path, settings, tx.clone(), cancelled)
+                            {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    tx.send(ProgressMsg::Error(err.to_string())).ok();
+                                }
                             }
                         });
                     }
@@ -1153,10 +1161,19 @@ impl App for VoronoiApp {
                                                 let cancelled = self.process_cancelled.clone();
                                                 let path =
                                                     self.currently_processing.clone().unwrap();
-                                                move || {
-                                                    calculate::process(
-                                                        path, settings, tx, cancelled,
-                                                    );
+                                                move || match calculate::process(
+                                                    path,
+                                                    settings,
+                                                    tx.clone(),
+                                                    cancelled,
+                                                ) {
+                                                    Ok(()) => {}
+                                                    Err(err) => {
+                                                        tx.send(ProgressMsg::Error(
+                                                            err.to_string(),
+                                                        ))
+                                                        .ok();
+                                                    }
                                                 }
                                             });
                                         } else {

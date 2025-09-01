@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
 };
@@ -16,7 +17,7 @@ pub struct GenerationSettings {
 impl GenerationSettings {
     pub fn default() -> Self {
         Self {
-            proximity_importance: 10,
+            proximity_importance: 12,
             rescale: None,
         }
     }
@@ -86,21 +87,15 @@ pub fn process<P: AsRef<Path>>(
     settings: GenerationSettings,
     tx: mpsc::SyncSender<ProgressMsg>,
     cancelled: Arc<AtomicBool>,
-) {
+) -> Result<(), Box<dyn Error>> {
     let start_time = std::time::Instant::now();
-    let mut target = image::open(TARGET_IMAGE_PATH).unwrap().to_rgb8();
-    let mut target_weights = image::open(TARGET_WEIGHTS_PATH).unwrap().to_rgb8();
+    let mut target = image::open(TARGET_IMAGE_PATH)?.to_rgb8();
+    let mut target_weights = image::open(TARGET_WEIGHTS_PATH)?.to_rgb8();
     if target.dimensions().0 != target.dimensions().1 {
-        tx.send(ProgressMsg::Error("Target image must be square".into()))
-            .unwrap();
-        return;
+        return Err("Target image must be square".into());
     }
     if target.dimensions() != target_weights.dimensions() {
-        tx.send(ProgressMsg::Error(
-            "Target and weights images must have the same dimensions".into(),
-        ))
-        .unwrap();
-        return;
+        return Err("Target and weights images must have the same dimensions".into());
     }
 
     if let Some(rescale) = settings.rescale {
@@ -125,7 +120,7 @@ pub fn process<P: AsRef<Path>>(
         .unwrap()
         .to_string();
 
-    let source = image::open(source_path).unwrap().to_rgb8();
+    let source = image::open(source_path)?.to_rgb8();
     // rescale source to match target dimensions
     let source = image::imageops::resize(
         &source,
@@ -251,10 +246,9 @@ pub fn process<P: AsRef<Path>>(
             }
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 tx.send(ProgressMsg::Cancelled).unwrap();
-                return;
+                return Ok(());
             }
-            tx.send(ProgressMsg::Progress(root as f32 / nx as f32))
-                .unwrap();
+            tx.send(ProgressMsg::Progress(root as f32 / nx as f32))?;
         }
         (
             lx.into_iter().sum::<i64>() + ly.into_iter().sum::<i64>(),
@@ -281,31 +275,26 @@ pub fn process<P: AsRef<Path>>(
         counter += 1;
     }
 
-    std::fs::create_dir_all(format!("./presets/{}", dir_name)).unwrap();
-    img.save(format!("./presets/{}/output.png", dir_name))
-        .unwrap();
-    source
-        .save(format!("./presets/{}/source.png", dir_name))
-        .unwrap();
-    target
-        .save(format!("./presets/{}/target.png", dir_name))
-        .unwrap();
+    std::fs::create_dir_all(format!("./presets/{}", dir_name))?;
+    img.save(format!("./presets/{}/output.png", dir_name))?;
+    source.save(format!("./presets/{}/source.png", dir_name))?;
+    target.save(format!("./presets/{}/target.png", dir_name))?;
     std::fs::write(
         format!("./presets/{}/assignments.json", dir_name),
         serialize_assignments(assignments),
-    )
-    .unwrap();
+    )?;
 
     tx.send(ProgressMsg::Done(PathBuf::from(format!(
         "./presets/{}",
         dir_name
-    ))))
-    .unwrap();
+    ))))?;
 
     println!(
         "finished in {:.2?} seconds",
         std::time::Instant::now().duration_since(start_time)
     );
+
+    Ok(())
 }
 
 fn load_weights(source: &image::DynamicImage) -> Vec<i64> {
