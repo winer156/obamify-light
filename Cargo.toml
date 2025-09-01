@@ -1,0 +1,19 @@
+[package]
+name = "obamafy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.32.1", features = ["wgpu"] }
+egui = "0.32.1"
+egui-wgpu = "0.32.1"
+wgpu = "25.0"
+bytemuck = { version = "1.16", features = ["derive"] }
+rand = { version = "0.8", features = ["small_rng"] }
+image = "0.25.6"
+
+palette = "0.7.6"
+pathfinding = "4.13.0"
+indexmap = "2.11.0"
+
+rfd = "0.15.4"
