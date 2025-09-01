@@ -58,7 +58,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "obamify";
-            version = "0.1.0";
+            version = "1.0";
 
             src = ./.;
 
@@ -77,7 +77,7 @@
         {
           default = {
             type = "app";
-            program = "${inputs.self.packages.${systemStr}.default}/bin/obamify";
+            program = "${inputs.self.packages.${systemStr}.default}/bin/obamafy";
           };
         }
       );
