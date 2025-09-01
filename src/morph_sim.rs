@@ -46,8 +46,6 @@ pub fn init_image(sidelen: u32, source_dir: PathBuf) -> (u32, Vec<SeedPos>, Vec<
             });
         }
     }
-
-    //let dst_force_map = image::open("src/rust_output/obama128_order.png").unwrap();
     sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
 
     for (dst_idx, src_idx) in assignments.iter().enumerate() {
@@ -55,8 +53,8 @@ pub fn init_image(sidelen: u32, source_dir: PathBuf) -> (u32, Vec<SeedPos>, Vec<
         let src_y = (src_idx / width) as f32;
         let dst_x = (dst_idx % width) as f32;
         let dst_y = (dst_idx / width) as f32;
-        //let p = dst_force_map.get_pixel((dst_idx % width) as u32, (dst_idx / width) as u32);
-        let dst_force = 0.13; //(p[0] as f32 / 255.0) * 0.3 + 0.07;
+
+        let dst_force = 0.13;
 
         sim.cells[*src_idx] = CellBody::new(
             (src_x + 0.5) * pixelsize,
@@ -120,8 +118,8 @@ impl CellBody {
         self.accx = 0.0;
         self.accy = 0.0;
 
-        self.velx *= 0.99;
-        self.vely *= 0.99;
+        self.velx *= 0.97;
+        self.vely *= 0.97;
 
         // self.velx = self.velx.clamp(-MAX_VELOCITY, MAX_VELOCITY);
         // self.vely = self.vely.clamp(-MAX_VELOCITY, MAX_VELOCITY);

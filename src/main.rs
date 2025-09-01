@@ -1,5 +1,9 @@
 mod morph_sim;
-use std::{num::NonZeroU64, path::PathBuf, sync::mpsc};
+use std::{
+    num::NonZeroU64,
+    path::PathBuf,
+    sync::{atomic::AtomicBool, mpsc, Arc},
+};
 
 use bytemuck::{Pod, Zeroable};
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
@@ -8,7 +12,7 @@ use egui_wgpu::{self, wgpu};
 use wgpu::util::DeviceExt;
 
 use crate::{
-    calculate::ProgressMsg,
+    calculate::{GenerationSettings, ProgressMsg},
     morph_sim::{preset_path_to_name, Sim},
 };
 
@@ -62,6 +66,9 @@ pub struct VoronoiApp {
     progress_tx: mpsc::SyncSender<ProgressMsg>,
     progress_rx: mpsc::Receiver<ProgressMsg>,
     last_progress: f32,
+    process_cancelled: Arc<AtomicBool>,
+    quick_process: bool,
+    currently_processing: Option<PathBuf>,
 
     presets: Vec<PathBuf>,
 
@@ -583,7 +590,7 @@ impl VoronoiApp {
         Self {
             size,
             seed_count,
-            animate: false,
+            animate: true,
             refined: true,
             fps_text: String::new(),
             seeds,
@@ -621,6 +628,9 @@ impl VoronoiApp {
             progress_rx,
             show_progress_modal: false,
             last_progress: 0.0,
+            process_cancelled: Arc::new(AtomicBool::new(false)),
+            quick_process: false,
+            currently_processing: None,
         }
     }
 
@@ -1041,7 +1051,10 @@ impl App for VoronoiApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.animate, egui::Button::new("transform"))
+                    .add_enabled(
+                        !self.animate,
+                        egui::Button::new("play transformation"), //.fill(egui::Color32::from_rgb(47, 92, 34)),
+                    )
                     .clicked()
                 {
                     self.animate = true;
@@ -1080,16 +1093,21 @@ impl App for VoronoiApp {
                 if ui.button("obamify new image").clicked() {
                     // open file select
                     let file = rfd::FileDialog::new()
-                        .set_title("choose image")
+                        .set_title("choose image (square aspect ratio recommended)")
                         .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
                         .pick_file();
                     if let Some(path) = file {
                         self.show_progress_modal = true;
+                        self.quick_process = false;
+
+                        let settings = GenerationSettings::default();
+                        self.currently_processing = Some(path.clone());
 
                         std::thread::spawn({
                             let tx = self.progress_tx.clone();
+                            let cancelled = self.process_cancelled.clone();
                             move || {
-                                calculate::process(path, tx);
+                                calculate::process(path, settings, tx, cancelled);
                             }
                         });
                     }
@@ -1097,36 +1115,89 @@ impl App for VoronoiApp {
 
                 if self.show_progress_modal {
                     Modal::new("progress_modal".into()).show(ui.ctx(), |ui| {
-                        if let Ok(msg) = self.progress_rx.try_recv() {
-                            match msg {
-                                ProgressMsg::Done(path) => {
-                                    self.presets = get_presets();
-                                    self.change_sim(device, path);
-                                    self.animate = false;
-                                    self.show_progress_modal = false;
-                                    ui.close();
-                                }
-                                ProgressMsg::Progress(p) => {
-                                    ui.label("processing...");
-                                    self.last_progress = p;
-                                    ui.add(egui::ProgressBar::new(p as f32).show_percentage());
-                                }
-                                ProgressMsg::Error(err) => {
-                                    ui.label(format!("error: {}", err));
-                                    if ui.button("close").clicked() {
+                        let processing_label_message = if self.quick_process {
+                            "processing..."
+                        } else {
+                            "processing... (could take a while)"
+                        };
+                        ui.vertical(|ui| {
+                            ui.set_min_width(ui.available_width().min(400.0));
+                            if let Ok(msg) = self.progress_rx.try_recv() {
+                                match msg {
+                                    ProgressMsg::Done(path) => {
+                                        self.presets = get_presets();
+                                        self.change_sim(device, path);
+                                        self.animate = true;
+                                        self.show_progress_modal = false;
                                         ui.close();
                                     }
-                                }
-                            }
-                        } else {
-                            ui.label("processing...");
-                            ui.add(egui::ProgressBar::new(self.last_progress).show_percentage());
-                        }
+                                    ProgressMsg::Progress(p) => {
+                                        ui.label(processing_label_message);
+                                        self.last_progress = p;
+                                        ui.add(egui::ProgressBar::new(p as f32).show_percentage());
+                                    }
+                                    ProgressMsg::Error(err) => {
+                                        ui.label(format!("error: {}", err));
+                                        if ui.button("close").clicked() {
+                                            ui.close();
+                                        }
+                                    }
+                                    ProgressMsg::Cancelled => {
+                                        self.process_cancelled
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                        if self.quick_process {
+                                            let settings = GenerationSettings::quick_process();
 
-                        if ui.button("cancel").clicked() {
-                            self.show_progress_modal = false;
-                            ui.close();
-                        }
+                                            std::thread::spawn({
+                                                let tx = self.progress_tx.clone();
+                                                let cancelled = self.process_cancelled.clone();
+                                                let path =
+                                                    self.currently_processing.clone().unwrap();
+                                                move || {
+                                                    calculate::process(
+                                                        path, settings, tx, cancelled,
+                                                    );
+                                                }
+                                            });
+                                        } else {
+                                            self.show_progress_modal = false;
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            } else {
+                                if self
+                                    .process_cancelled
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    ui.label("cancelling...");
+                                } else {
+                                    ui.label(processing_label_message);
+                                }
+                                ui.add(
+                                    egui::ProgressBar::new(self.last_progress).show_percentage(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("cancel").clicked() {
+                                    self.quick_process = false;
+                                    self.process_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    self.last_progress = 0.0;
+                                }
+
+                                if !self.quick_process
+                                    && ui
+                                        .button("make faster, lower quality result instead")
+                                        .clicked()
+                                {
+                                    self.process_cancelled
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    self.last_progress = 0.0;
+                                    self.quick_process = true;
+                                }
+                            })
+                        });
                     });
 
                     // if modal.should_close() {
@@ -1169,7 +1240,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     }; // wgpu backend is selected via the `wgpu` feature
     eframe::run_native(
-        "obamafication",
+        "obamify",
         native_options,
         Box::new(|cc| Ok(Box::new(VoronoiApp::new(cc)))),
     )

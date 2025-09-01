@@ -1,18 +1,42 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use egui::ahash::AHasher;
 use image::GenericImageView;
-use pathfinding::{kuhn_munkres::kuhn_munkres, prelude::Weights};
+use pathfinding::prelude::Weights;
 use std::sync::mpsc;
+
+pub struct GenerationSettings {
+    proximity_importance: i64,
+    rescale: Option<u32>,
+}
+
+impl GenerationSettings {
+    pub fn default() -> Self {
+        Self {
+            proximity_importance: 10,
+            rescale: None,
+        }
+    }
+
+    pub fn quick_process() -> Self {
+        Self {
+            proximity_importance: 10,
+            rescale: Some(64),
+        }
+    }
+}
 
 struct ImgDiffWeights {
     source: Vec<(u8, u8, u8)>,
     target: Vec<(u8, u8, u8)>,
     weights: Vec<i64>,
     sidelen: usize,
+    settings: GenerationSettings,
 }
 
-const PROXIMITY_IMPORTANCE: i64 = 12; // turn into user controlled option?
 const TARGET_IMAGE_PATH: &str = "./target.png";
 const TARGET_WEIGHTS_PATH: &str = "./weights.png";
 
@@ -37,8 +61,8 @@ impl Weights<i64> for ImgDiffWeights {
         let dg = g1 as i64 - g2 as i64;
         let db = b1 as i64 - b2 as i64;
 
-        let out = -((dr.pow(2) + dg.pow(2) + db.pow(2) * self.weights[row])
-            + (dist * PROXIMITY_IMPORTANCE).pow(2));
+        let out = -((dr.pow(2) + dg.pow(2) + db.pow(2)) * self.weights[row]
+            + (dist * self.settings.proximity_importance).pow(2));
 
         out
     }
@@ -52,24 +76,46 @@ pub enum ProgressMsg {
     Progress(f32),
     Done(PathBuf), // result directory
     Error(String),
+    Cancelled,
 }
 
 type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<AHasher>>;
 
-pub fn process<P: AsRef<Path>>(source_path: P, tx: mpsc::SyncSender<ProgressMsg>) {
-    let target = image::open(TARGET_IMAGE_PATH).unwrap().to_rgb8();
-    let weights = image::open(TARGET_WEIGHTS_PATH).unwrap().to_rgb8();
+pub fn process<P: AsRef<Path>>(
+    source_path: P,
+    settings: GenerationSettings,
+    tx: mpsc::SyncSender<ProgressMsg>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let start_time = std::time::Instant::now();
+    let mut target = image::open(TARGET_IMAGE_PATH).unwrap().to_rgb8();
+    let mut target_weights = image::open(TARGET_WEIGHTS_PATH).unwrap().to_rgb8();
     if target.dimensions().0 != target.dimensions().1 {
         tx.send(ProgressMsg::Error("Target image must be square".into()))
             .unwrap();
         return;
     }
-    if target.dimensions() != weights.dimensions() {
+    if target.dimensions() != target_weights.dimensions() {
         tx.send(ProgressMsg::Error(
             "Target and weights images must have the same dimensions".into(),
         ))
         .unwrap();
         return;
+    }
+
+    if let Some(rescale) = settings.rescale {
+        target = image::imageops::resize(
+            &target,
+            rescale,
+            rescale,
+            image::imageops::FilterType::Lanczos3,
+        );
+        target_weights = image::imageops::resize(
+            &target_weights,
+            rescale,
+            rescale,
+            image::imageops::FilterType::Lanczos3,
+        );
     }
     let base_name = source_path
         .as_ref()
@@ -85,7 +131,7 @@ pub fn process<P: AsRef<Path>>(source_path: P, tx: mpsc::SyncSender<ProgressMsg>
         &source,
         target.width(),
         target.height(),
-        image::imageops::FilterType::Triangle,
+        image::imageops::FilterType::Lanczos3,
     );
 
     let source_pixels = source
@@ -96,10 +142,11 @@ pub fn process<P: AsRef<Path>>(source_path: P, tx: mpsc::SyncSender<ProgressMsg>
     let weights = ImgDiffWeights {
         source: source_pixels.clone(),
         target: target.pixels().map(|p| (p[0], p[1], p[2])).collect(),
-        weights: load_weights(&image::open(TARGET_WEIGHTS_PATH).unwrap()),
+        weights: load_weights(&target_weights.into()),
         sidelen: target.width() as usize,
+        settings,
     };
-
+    // pathfinding::kuhn_munkres, inlined to allow for progress bar and cancelling
     let (_total_diff, assignments) = {
         // We call x the rows and y the columns. (nx, ny) is the size of the matrix.
         let nx = weights.rows();
@@ -202,7 +249,10 @@ pub fn process<P: AsRef<Path>>(source_path: P, tx: mpsc::SyncSender<ProgressMsg>
                 xy[x] = y;
                 y = prec;
             }
-
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                tx.send(ProgressMsg::Cancelled).unwrap();
+                return;
+            }
             tx.send(ProgressMsg::Progress(root as f32 / nx as f32))
                 .unwrap();
         }
@@ -251,6 +301,11 @@ pub fn process<P: AsRef<Path>>(source_path: P, tx: mpsc::SyncSender<ProgressMsg>
         dir_name
     ))))
     .unwrap();
+
+    println!(
+        "finished in {:.2?} seconds",
+        std::time::Instant::now().duration_since(start_time)
+    );
 }
 
 fn load_weights(source: &image::DynamicImage) -> Vec<i64> {
