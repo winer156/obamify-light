@@ -1,25 +1,11 @@
-use std::{cell, fs, mem, path::PathBuf};
+use std::{fs, mem, path::PathBuf};
 
 use crate::{SeedColor, SeedPos};
-use egui::epaint::tessellator::Path;
 use image::GenericImageView;
 
 pub fn init_image(sidelen: u32, source_dir: PathBuf) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
     // load rust_output/source.png
     let source = image::open(source_dir.join("source.png")).unwrap();
-
-    let mut seeds = Vec::new();
-    let mut colors = Vec::new();
-    let mut sim = Sim::new(&source_dir);
-
-    let width = source.width() as usize;
-    let height = source.height() as usize;
-
-    assert_eq!(width, height);
-
-    let seeds_n = width * height;
-    let pixelsize = sidelen as f32 / width as f32;
-
     let assignments = fs::read_to_string(source_dir.join("assignments.json"))
         .unwrap()
         .strip_prefix('[')
@@ -29,6 +15,18 @@ pub fn init_image(sidelen: u32, source_dir: PathBuf) -> (u32, Vec<SeedPos>, Vec<
         .split(',')
         .map(|s| s.parse().unwrap())
         .collect::<Vec<usize>>();
+
+    let mut seeds = Vec::new();
+    let mut colors = Vec::new();
+    let mut sim = Sim::new(source_dir);
+
+    let width = source.width() as usize;
+    let height = source.height() as usize;
+
+    assert_eq!(width, height);
+
+    let seeds_n = width * height;
+    let pixelsize = sidelen as f32 / width as f32;
 
     for y in 0..width {
         for x in 0..width {
@@ -186,11 +184,11 @@ pub struct Sim {
 }
 
 impl Sim {
-    pub fn new(source_dir: &PathBuf) -> Self {
+    pub fn new(source_dir: PathBuf) -> Self {
         Self {
             cells: Vec::new(),
             elapsed_frames: 0,
-            source: source_dir.clone(),
+            source: source_dir,
         }
     }
 
@@ -217,11 +215,11 @@ impl Sim {
 
         let mut grid = vec![vec![]; self.cells.len()];
 
-        for i in 0..self.cells.len() {
-            let x = positions[i].xy[0] / pixel_size;
-            let y = positions[i].xy[1] / pixel_size;
+        for (i, p) in positions.iter().enumerate() {
+            let x = p.xy[0] / pixel_size;
+            let y = p.xy[1] / pixel_size;
 
-            let index = (y.floor().clamp(0.0, grid_size - 1.0) * grid_size as f32) as usize
+            let index = (y.floor().clamp(0.0, grid_size - 1.0) * grid_size) as usize
                 + (x.floor().clamp(0.0, grid_size - 1.0) as usize);
             //
             grid[index].push(i);

@@ -1,11 +1,9 @@
-//#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 mod morph_sim;
 use std::{
-    fmt::format,
     fs::File,
-    io::Cursor,
-    num::{NonZeroU32, NonZeroU64},
+    num::NonZeroU64,
     path::PathBuf,
     sync::{atomic::AtomicBool, mpsc, Arc},
 };
@@ -13,9 +11,8 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use color_quant::NeuQuant;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
-use egui::{epaint::tessellator::Path, Color32, Modal, ViewportBuilder};
+use egui::{Color32, Modal, ViewportBuilder};
 use egui_wgpu::{self, wgpu};
-use palette::rgb;
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -95,7 +92,6 @@ pub struct VoronoiApp {
     size: (u32, u32),
     seed_count: u32,
     animate: bool,
-    refined: bool,
     fps_text: String,
     show_progress_modal: bool,
     progress_tx: mpsc::SyncSender<ProgressMsg>,
@@ -106,8 +102,6 @@ pub struct VoronoiApp {
     currently_processing: Option<PathBuf>,
 
     presets: Vec<PathBuf>,
-
-    resolution: u32,
 
     gif_status: GifStatus,
     gif_encoder: Option<gif::Encoder<File>>,
@@ -634,7 +628,6 @@ impl VoronoiApp {
             size,
             seed_count,
             animate: true,
-            refined: true,
             fps_text: String::new(),
             seeds,
             colors,
@@ -666,7 +659,6 @@ impl VoronoiApp {
             shade_bg,
             prev_frame_time: std::time::Instant::now(),
             presets,
-            resolution: DEFAULT_RESOLUTION,
 
             progress_tx,
             progress_rx,
@@ -919,8 +911,8 @@ impl VoronoiApp {
             cpass.set_pipeline(&self.clear_pipeline);
             cpass.set_bind_group(0, bg, &[]);
             cpass.dispatch_workgroups(
-                div_up(self.size.0, WG_SIZE_XY),
-                div_up(self.size.1, WG_SIZE_XY),
+                self.size.0.div_ceil(WG_SIZE_XY),
+                self.size.1.div_ceil(WG_SIZE_XY),
                 1,
             );
         }
@@ -933,7 +925,7 @@ impl VoronoiApp {
             });
             cpass.set_pipeline(&self.seed_splat_pipeline);
             cpass.set_bind_group(0, &self.seed_bg, &[]);
-            cpass.dispatch_workgroups(div_up(self.seed_count, WG_SIZE_SEEDS), 1, 1);
+            cpass.dispatch_workgroups(self.seed_count.div_ceil(WG_SIZE_SEEDS), 1, 1);
             //
         }
 
@@ -946,8 +938,8 @@ impl VoronoiApp {
         }
         step >>= 1;
 
-        let groups_x = div_up(self.size.0, WG_SIZE_XY);
-        let groups_y = div_up(self.size.1, WG_SIZE_XY);
+        let groups_x = self.size.0.div_ceil(WG_SIZE_XY);
+        let groups_y = self.size.1.div_ceil(WG_SIZE_XY);
 
         let mut flip = false;
         while step >= 1 {
@@ -1152,7 +1144,7 @@ impl VoronoiApp {
         }
         drop(mapped);
         readback.unmap();
-        return Ok(rgba);
+        Ok(rgba)
     }
 
     fn write_frame_to_gif(
@@ -1269,10 +1261,6 @@ fn get_presets() -> Vec<PathBuf> {
     } else {
         Vec::new()
     }
-}
-
-fn div_up(n: u32, d: u32) -> u32 {
-    (n + d - 1) / d
 }
 
 impl App for VoronoiApp {
@@ -1443,7 +1431,7 @@ impl App for VoronoiApp {
                                     ProgressMsg::Progress(p) => {
                                         ui.label(processing_label_message);
                                         self.last_progress = p;
-                                        ui.add(egui::ProgressBar::new(p as f32).show_percentage());
+                                        ui.add(egui::ProgressBar::new(p).show_percentage());
                                     }
                                     ProgressMsg::Error(err) => {
                                         ui.label(format!("error: {}", err));

@@ -17,7 +17,7 @@ pub struct GenerationSettings {
 impl GenerationSettings {
     pub fn default() -> Self {
         Self {
-            proximity_importance: 15,
+            proximity_importance: 13,
             rescale: None,
         }
     }
@@ -62,10 +62,8 @@ impl Weights<i64> for ImgDiffWeights {
         let dg = g1 as i64 - g2 as i64;
         let db = b1 as i64 - b2 as i64;
 
-        let out = -((dr.pow(2) + dg.pow(2) + db.pow(2)) * self.weights[row]
-            + (dist * self.settings.proximity_importance).pow(2));
-
-        out
+        -((dr.pow(2) + dg.pow(2) + db.pow(2)) * self.weights[row]
+            + (dist * self.settings.proximity_importance).pow(2))
     }
 
     fn neg(&self) -> Self {
