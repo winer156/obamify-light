@@ -17,7 +17,7 @@ pub struct GenerationSettings {
 impl GenerationSettings {
     pub fn default() -> Self {
         Self {
-            proximity_importance: 12,
+            proximity_importance: 15,
             rescale: None,
         }
     }

@@ -1,16 +1,21 @@
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
 
 mod morph_sim;
 use std::{
-    num::NonZeroU64,
+    fmt::format,
+    fs::File,
+    io::Cursor,
+    num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::{atomic::AtomicBool, mpsc, Arc},
 };
 
 use bytemuck::{Pod, Zeroable};
+use color_quant::NeuQuant;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
-use egui::{Color32, Modal, ViewportBuilder};
+use egui::{epaint::tessellator::Path, Color32, Modal, ViewportBuilder};
 use egui_wgpu::{self, wgpu};
+use palette::rgb;
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -55,6 +60,34 @@ struct ParamsJfa {
 }
 
 const DEFAULT_RESOLUTION: u32 = 2048;
+const GIF_FRAMERATE: u32 = 8;
+const GIF_RESOLUTION: u32 = 512;
+const GIF_NUM_FRAMES: u32 = 150;
+const GIF_SPEED: f32 = 1.5;
+const GIF_PALETTE_SAMPLEFAC: i32 = 1;
+
+#[derive(Clone)]
+enum GifStatus {
+    None,
+    Recording(Option<PathBuf>),
+    Complete(PathBuf),
+    Error(String),
+}
+impl GifStatus {
+    fn is_recording(&self) -> bool {
+        match self {
+            GifStatus::Recording(_) => true,
+            _ => false,
+        }
+    }
+
+    fn not_recording(&self) -> bool {
+        match self {
+            GifStatus::None => true,
+            _ => false,
+        }
+    }
+}
 
 pub struct VoronoiApp {
     prev_frame_time: std::time::Instant,
@@ -76,10 +109,15 @@ pub struct VoronoiApp {
 
     resolution: u32,
 
+    gif_status: GifStatus,
+    gif_encoder: Option<gif::Encoder<File>>,
+    gif_palette: Option<NeuQuant>,
+    gif_frame_count: u32,
     sim: Sim,
 
     // Seeds CPU copy
     seeds: Vec<SeedPos>,
+    colors: Vec<SeedColor>,
 
     // EGUI texture id for presenting the shaded RGBA texture
     egui_tex_id: Option<egui::TextureId>,
@@ -127,6 +165,7 @@ impl VoronoiApp {
         let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source_dir);
         self.seed_count = seed_count;
         self.seeds = seeds;
+
         self.sim = sim;
 
         // Update GPU buffers
@@ -153,6 +192,8 @@ impl VoronoiApp {
             contents: bytemuck::cast_slice(&colors),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+
+        self.colors = colors;
 
         self.rebuild_bind_groups(device);
     }
@@ -596,6 +637,7 @@ impl VoronoiApp {
             refined: true,
             fps_text: String::new(),
             seeds,
+            colors,
             egui_tex_id: None,
             seed_buf,
             color_buf,
@@ -633,6 +675,11 @@ impl VoronoiApp {
             process_cancelled: Arc::new(AtomicBool::new(false)),
             quick_process: false,
             currently_processing: None,
+
+            gif_encoder: None,
+            gif_status: GifStatus::None,
+            gif_frame_count: 0,
+            gif_palette: None,
         }
     }
 
@@ -684,9 +731,11 @@ impl VoronoiApp {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm, // linear
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING, // sample in egui
-            view_formats: &[], // <- no sRGB alt view
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         (tex, view)
@@ -805,6 +854,52 @@ impl VoronoiApp {
                 },
             ],
         });
+    }
+
+    fn resize_textures(&mut self, device: &wgpu::Device, new_size: (u32, u32), rebuild_bg: bool) {
+        self.size = new_size;
+        // Recreate textures
+        let (ids_a, ids_a_view) = Self::make_ids_texture(device, self.size, Some("ids_a"));
+        let (ids_b, ids_b_view) = Self::make_ids_texture(device, self.size, Some("ids_b"));
+        let (color_tex, color_view) = Self::make_color_texture(device, self.size, Some("color"));
+        self.ids_a = ids_a;
+        self.ids_a_view = ids_a_view;
+        self.ids_b = ids_b;
+        self.ids_b_view = ids_b_view;
+        self.color_tex = color_tex;
+        self.color_view = color_view;
+
+        // Update params_common
+        let params_common = ParamsCommon {
+            width: self.size.0,
+            height: self.size.1,
+            n_seeds: self.seed_count,
+            _pad: 0,
+        };
+        self.params_common_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params_common"),
+            contents: bytemuck::bytes_of(&params_common),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let params_jfa = ParamsJfa {
+            width: self.size.0,
+            height: self.size.1,
+            step: 1,
+            _pad: 0,
+        };
+
+        self.params_jfa_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params_jfa"),
+            contents: bytemuck::bytes_of(&params_jfa),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        if rebuild_bg {
+            self.rebuild_bind_groups(device);
+        }
+
+        // Force re-registering the egui texture
+        self.egui_tex_id = None;
     }
 
     fn run_gpu(&mut self, rs: &egui_wgpu::RenderState) {
@@ -983,6 +1078,181 @@ impl VoronoiApp {
         // Submit
         rs.queue.submit(std::iter::once(encoder.finish()));
     }
+
+    pub fn get_color_image_data(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let width = self.size.0;
+        let height = self.size.1;
+        let bpp = 4u32; // RGBA8
+        let unpadded_bytes_per_row = width * bpp;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256
+        let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+        let buffer_size = padded_bytes_per_row as u64 * height as u64;
+
+        // Staging buffer to receive the texture
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("color readback"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Encode copy
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy color_tex -> buffer"),
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.color_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            // res: Result<(), wgpu::BufferAsyncError>
+            let _ = tx.send(res);
+        });
+
+        // Ensure the callback runs
+        device.poll(wgpu::PollType::Wait)?;
+
+        // Wait for the result and propagate any map error
+        pollster::block_on(rx.receive()).expect("map_async sender dropped")?;
+        let mapped = slice.get_mapped_range();
+        // Remove row padding
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height as usize {
+            let start = y * padded_bytes_per_row as usize;
+            let end = start + unpadded_bytes_per_row as usize;
+            rgba.extend_from_slice(&mapped[start..end]);
+        }
+        drop(mapped);
+        readback.unmap();
+        return Ok(rgba);
+    }
+
+    fn write_frame_to_gif(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let rgba = self.get_color_image_data(device, queue)?;
+        // let image =
+        //     image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(self.size.0, self.size.1, rgba)
+        //         .unwrap();
+        // // resize to GIF_RESOLUTION
+        // let resized = image::imageops::resize(
+        //     &image,
+        //     GIF_RESOLUTION,
+        //     GIF_RESOLUTION,
+        //     image::imageops::FilterType::Lanczos3,
+        // );
+
+        // if self.gif_status.is_recording() && self.gif_encoder.is_none() {
+        //     resized.save("testframe.png")?;
+        // }
+
+        // let rgba = resized.into_raw();
+
+        // if first frame, create encoder
+        if self.gif_status.is_recording() && self.gif_encoder.is_none() {
+            let file = rfd::FileDialog::new()
+                .set_title("save gif")
+                .add_filter("gif", &["gif"])
+                .set_file_name(format!("{}.gif", self.sim.name()))
+                .save_file();
+            if let Some(path) = file {
+                let colors = self
+                    .colors
+                    .iter()
+                    .flat_map(|s| s.rgba.map(|f| (f * 256.0) as u8))
+                    .collect::<Vec<u8>>();
+                let gif_palette = NeuQuant::new(GIF_PALETTE_SAMPLEFAC, 256, &colors);
+
+                let file = std::fs::File::create(&path)?;
+                // save a test image of the palette
+                // {
+                //     let mut img = image::ImageBuffer::new(16, 16);
+                //     for (i, pixel) in gif_palette.color_map_rgb().chunks_exact(3).enumerate() {
+                //         img.put_pixel(
+                //             i as u32 % 16,
+                //             i as u32 / 16,
+                //             image::Rgba([pixel[0], pixel[1], pixel[2], 255]),
+                //         );
+                //     }
+                //     img.save("palette.png")?;
+                // }
+                // clear file
+                file.set_len(0)?;
+                let mut encoder = gif::Encoder::new(
+                    file,
+                    GIF_RESOLUTION as u16,
+                    GIF_RESOLUTION as u16,
+                    &gif_palette.color_map_rgb(),
+                )?;
+                self.gif_palette = Some(gif_palette);
+                encoder.set_repeat(gif::Repeat::Infinite)?;
+                self.gif_encoder = Some(encoder);
+                self.gif_frame_count = 0;
+                self.gif_status = GifStatus::Recording(Some(path));
+            } else {
+                // cancelled
+                self.stop_recording_gif(device);
+                return Ok(());
+            }
+        }
+
+        if let Some(encoder) = &mut self.gif_encoder {
+            let nq = self.gif_palette.as_ref().unwrap();
+            let pixels: Vec<u8> = rgba
+                .chunks_exact(4)
+                .map(|pix| nq.index_of(pix) as u8)
+                .collect();
+            let mut frame = gif::Frame::from_indexed_pixels(
+                GIF_RESOLUTION as u16,
+                GIF_RESOLUTION as u16,
+                pixels,
+                None,
+            );
+
+            frame.delay = ((100.0 / GIF_FRAMERATE as f32) / GIF_SPEED) as u16; // delay in 1/100 sec
+            encoder.write_frame(&frame)?;
+        }
+
+        Ok(())
+    }
+
+    fn stop_recording_gif(&mut self, device: &wgpu::Device) {
+        self.gif_status = GifStatus::None;
+        self.gif_encoder = None;
+        self.animate = false;
+        self.resize_textures(device, (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION), false);
+        self.change_sim(device, self.sim.source_path());
+    }
 }
 
 fn get_presets() -> Vec<PathBuf> {
@@ -1025,23 +1295,42 @@ impl App for VoronoiApp {
         // Ensure texture is registered exactly once per allocation
         self.ensure_registered_texture(rs);
 
+        // Run GPU pipeline
+
+        self.run_gpu(rs);
+
         // Optionally animate seeds a bit
         if self.animate {
-            // for s in &mut self.seeds {
-            //     s.xy[0] = (s.xy[0] + 1.0).rem_euclid(self.size.0 as f32);
-            //     s.xy[1] = (s.xy[1] + 1.0).rem_euclid(self.size.1 as f32);
-            // }
-            // rs.queue
-            //     .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
+            if self.gif_status.is_recording() {
+                for _ in 0..(60 / GIF_FRAMERATE) {
+                    self.sim.update(&mut self.seeds, self.size.0);
+                }
 
-            self.sim.update(&mut self.seeds, self.size.0);
+                if let Err(e) = self.write_frame_to_gif(device, &rs.queue) {
+                    self.gif_status = GifStatus::Error(e.to_string());
+                    self.animate = false;
+                } else {
+                    self.gif_frame_count += 1;
+
+                    if self.gif_frame_count >= GIF_NUM_FRAMES {
+                        // finish recording
+                        // self.stop_recording_gif(device);
+                        if let GifStatus::Recording(Some(path)) = self.gif_status.clone() {
+                            self.gif_status = GifStatus::Complete(path);
+                        } else {
+                            self.gif_status = GifStatus::Error("Something weird happened".into());
+                        }
+
+                        self.animate = false;
+                    }
+                }
+            } else {
+                self.sim.update(&mut self.seeds, self.size.0);
+            }
             rs.queue
                 .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
         }
 
-        // Run GPU pipeline
-
-        self.run_gpu(rs);
         let dt = self.prev_frame_time.elapsed();
         self.prev_frame_time = std::time::Instant::now();
         self.fps_text = format!(
@@ -1073,6 +1362,18 @@ impl App for VoronoiApp {
                     self.change_sim(device, self.sim.source_path());
                     self.animate = false;
                 }
+                ui.separator();
+
+                if ui.button("save gif").clicked() {
+                    self.gif_status = GifStatus::Recording(None);
+                    self.resize_textures(device, (GIF_RESOLUTION, GIF_RESOLUTION), false);
+                    self.change_sim(device, self.sim.source_path());
+                    self.animate = true;
+                    for _ in 0..20 {
+                        self.sim.update(&mut self.seeds, self.size.0);
+                    }
+                }
+
                 ui.separator();
                 // choose preset
                 // for (i, preset) in self.presets.clone().into_iter().enumerate() {
@@ -1220,6 +1521,37 @@ impl App for VoronoiApp {
                     // if modal.should_close() {
                     //     self.show_progress_modal = false;
                     // }
+                } else if !self.gif_status.not_recording() {
+                    Modal::new("recording_progress".into()).show(ui.ctx(), |ui| {
+                        match self.gif_status.clone() {
+                            GifStatus::Recording(_) => {
+                                ui.label("Recording GIF...");
+                            }
+
+                            GifStatus::Error(err) => {
+                                ui.label(format!("Error: {}", err));
+                                ui.horizontal(|ui| {
+                                    if ui.button("close").clicked() {
+                                        self.stop_recording_gif(device);
+                                    }
+                                });
+                            }
+                            GifStatus::Complete(path) => {
+                                ui.label("gif saved!");
+                                ui.horizontal(|ui| {
+                                    if ui.button("open folder").clicked() {
+                                        if let Some(parent) = path.parent() {
+                                            opener::open(parent).ok();
+                                        }
+                                    }
+                                    if ui.button("close").clicked() {
+                                        self.stop_recording_gif(device);
+                                    }
+                                });
+                            }
+                            GifStatus::None => unreachable!(),
+                        }
+                    });
                 }
 
                 ui.separator();
