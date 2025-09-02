@@ -58,8 +58,8 @@ struct ParamsJfa {
 
 const DEFAULT_RESOLUTION: u32 = 2048;
 const GIF_FRAMERATE: u32 = 8;
-const GIF_RESOLUTION: u32 = 512;
-const GIF_NUM_FRAMES: u32 = 150;
+const GIF_RESOLUTION: u32 = 460;
+const GIF_NUM_FRAMES: u32 = 140;
 const GIF_SPEED: f32 = 1.5;
 const GIF_PALETTE_SAMPLEFAC: i32 = 1;
 
@@ -1328,6 +1328,7 @@ impl App for VoronoiApp {
         );
 
         // ===== UI =====
+        ctx.set_zoom_factor(1.4);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1542,8 +1543,8 @@ impl App for VoronoiApp {
                     });
                 }
 
-                ui.separator();
-                ui.label(&self.fps_text);
+                // ui.separator();
+                // ui.label(&self.fps_text);
             });
         });
 
