@@ -13,7 +13,7 @@ revolutionary new technology that turns any image into obama
 
 # Installations
 
-Install the latest version in [releases](https://github.com/Spu7Nix/obamify/releases) (windows only atm). Unzip and run the .exe file inside!
+Install the latest version in [releases](https://github.com/Spu7Nix/obamify/releases). Unzip and run the .exe file inside!
 
 ### Building from source
 
@@ -24,3 +24,11 @@ Install the latest version in [releases](https://github.com/Spu7Nix/obamify/rele
 
 magic
 
+# Contributing
+
+Here are some ideas for features to implement if you're interested:
+- Faster algorithms for calculating the image transformation
+- Better user experience with saving/loading presets
+- Building for web/WASM
+
+Feel free to make an issue or a pull request if you have any ideas :)
