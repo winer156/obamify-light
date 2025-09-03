@@ -2218,7 +2218,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "obamafy"
+name = "obamify"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
