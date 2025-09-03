@@ -1,0 +1,107 @@
+name: Build & Package (Windows, macOS, Linux)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"   # runs when you push a tag like v1.2.3
+  workflow_dispatch:  # allows manual runs from the Actions tab
+
+env:
+  BIN_NAME: obamify
+
+jobs:
+  build:
+    name: Build ${{ matrix.os_tag }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os_tag: linux
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            shell: bash
+            zip_cmd: zip -r
+          - runner: macos-14
+            os_tag: macos
+            target: aarch64-apple-darwin
+            ext: ""
+            shell: bash
+            zip_cmd: zip -r
+          - runner: windows-latest
+            os_tag: windows
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (release)
+        shell: ${{ matrix.shell }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: ${{ !startsWith(matrix.runner, 'windows') }}
+        shell: bash
+        run: |
+          APP="${{ env.BIN_NAME }}"
+          PKG="dist/${APP}-${{ matrix.os_tag }}"
+          BIN="target/${{ matrix.target }}/release/${APP}${{ matrix.ext }}"
+          test -f "$BIN" || (echo "Missing $BIN" && exit 1)
+          mkdir -p "$PKG"
+          cp "$BIN" "$PKG/"
+          test -d presets || (echo "./presets missing" && exit 1)
+          cp -R presets "$PKG/"
+          test -f target.png || (echo "./target.png missing" && exit 1)
+          test -f weights.png || (echo "./weights.png missing" && exit 1)
+          cp target.png weights.png "$PKG/"
+          (cd dist && ${{ matrix.zip_cmd }} "${APP}-${{ matrix.os_tag }}.zip" "${APP}-${{ matrix.os_tag }}")
+
+      - name: Package (Windows)
+        if: startsWith(matrix.runner, 'windows')
+        shell: pwsh
+        run: |
+          $App = "${{ env.BIN_NAME }}"
+          $Pkg = "dist/$App-${{ matrix.os_tag }}"
+          $Bin = "target/${{ matrix.target }}/release/$App${{ matrix.ext }}"
+          if (-not (Test-Path $Bin)) { throw "Missing $Bin" }
+          New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
+          Copy-Item $Bin -Destination $Pkg -Force
+          if (-not (Test-Path "presets")) { throw "./presets missing" }
+          Copy-Item -Recurse -Force "presets" $Pkg
+          if (-not (Test-Path "target.png")) { throw "./target.png missing" }
+          if (-not (Test-Path "weights.png")) { throw "./weights.png missing" }
+          Copy-Item "target.png","weights.png" -Destination $Pkg -Force
+          Compress-Archive -Path "$Pkg/*" -DestinationPath "dist/$App-${{ matrix.os_tag }}.zip" -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.os_tag }}
+          path: dist/*.zip
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Collect zips
+        run: |
+          mkdir -p upload
+          find dist -type f -name "*.zip" -exec cp {} upload/ \;
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
