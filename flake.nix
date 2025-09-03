@@ -58,7 +58,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "obamify";
-            version = "1.0";
+            version = "1.1";
 
             src = ./.;
 
@@ -66,8 +66,48 @@
               lockFile = ./Cargo.lock;
             };
 
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = [ pkgs.openssl ];
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              makeWrapper
+            ];
+            buildInputs = [
+              pkgs.openssl
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux (
+              with pkgs;
+              [
+                wayland
+                libxkbcommon
+                xorg.libX11
+                xorg.libXcursor
+                xorg.libXrandr
+                xorg.libXi
+                vulkan-loader
+                libglvnd
+                mesa
+                egl-wayland
+              ]
+            );
+
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              	wrapProgram $out/bin/obamafy \
+              		--set-default WINIT_UNIX_BACKEND wayland \
+              		--set-default WGPU_BACKEND vulkan \
+              		--set LD_LIBRARY_PATH ${
+                  pkgs.lib.makeLibraryPath [
+                    pkgs.wayland
+                    pkgs.libxkbcommon
+                    pkgs.xorg.libX11
+                    pkgs.xorg.libXcursor
+                    pkgs.xorg.libXrandr
+                    pkgs.xorg.libXi
+                    pkgs.vulkan-loader
+                    pkgs.libglvnd
+                    pkgs.mesa
+                    pkgs.egl-wayland
+                  ]
+                }
+            '';
           };
         }
       );
@@ -83,21 +123,30 @@
       );
 
       devShells = forEachSupportedSystem (
-        { pkgs }:
+        { pkgs, ... }:
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              rustToolchain
-              openssl
-              pkg-config
-              cargo-deny
-              cargo-edit
-              cargo-watch
-              rust-analyzer
-            ];
+            packages =
+              with pkgs;
+              [
+                rustToolchain
+                openssl
+                pkg-config
+                cargo-deny
+                cargo-edit
+                cargo-watch
+                rust-analyzer
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+                wayland
+                libxkbcommon
+                xorg.libX11
+                xorg.libXcursor
+                xorg.libXrandr
+                xorg.libXi
+              ];
 
             env = {
-              # Required by rust-analyzer
               RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
             };
           };
