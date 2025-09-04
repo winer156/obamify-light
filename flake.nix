@@ -10,7 +10,12 @@
   };
 
   outputs =
-    inputs:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -20,14 +25,14 @@
       ];
       forEachSupportedSystem =
         f:
-        inputs.nixpkgs.lib.genAttrs supportedSystems (
+        nixpkgs.lib.genAttrs supportedSystems (
           system:
           f {
-            pkgs = import inputs.nixpkgs {
+            pkgs = import nixpkgs {
               inherit system;
               overlays = [
-                inputs.rust-overlay.overlays.default
-                inputs.self.overlays.default
+                rust-overlay.overlays.default
+                self.overlays.default
               ];
             };
             systemStr = system;
@@ -90,10 +95,10 @@
             );
 
             postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-              	wrapProgram $out/bin/obamafy \
-              		--set-default WINIT_UNIX_BACKEND wayland \
-              		--set-default WGPU_BACKEND vulkan \
-              		--set LD_LIBRARY_PATH ${
+              wrapProgram $out/bin/obamify \
+                --set-default WINIT_UNIX_BACKEND wayland \
+                --set-default WGPU_BACKEND vulkan \
+                --set LD_LIBRARY_PATH ${
                   pkgs.lib.makeLibraryPath [
                     pkgs.wayland
                     pkgs.libxkbcommon
@@ -108,6 +113,15 @@
                   ]
                 }
             '';
+
+            enableParallelBuild = true;
+
+            meta = {
+              description = "revolutionary new technology that turns any image into obama";
+              homepage = "htpps://github/Spu7Nix/obamify";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "obamify";
+            };
           };
         }
       );
@@ -117,7 +131,7 @@
         {
           default = {
             type = "app";
-            program = "${inputs.self.packages.${systemStr}.default}/bin/obamafy";
+            program = nixpkgs.lib.getExe self.packages.${systemStr}.default;
           };
         }
       );
