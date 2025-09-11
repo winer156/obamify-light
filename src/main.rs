@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
 
 mod morph_sim;
 use std::{
@@ -13,6 +13,7 @@ use color_quant::NeuQuant;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
 use egui::{Color32, Modal, ViewportBuilder};
 use egui_wgpu::{self, wgpu};
+use image::buffer::ConvertBuffer;
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -152,6 +153,7 @@ pub struct VoronoiApp {
     jfa_bg_a_to_b: wgpu::BindGroup,
     jfa_bg_b_to_a: wgpu::BindGroup,
     shade_bg: wgpu::BindGroup,
+    preview_image: Option<image::ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
 }
 
 impl VoronoiApp {
@@ -672,6 +674,8 @@ impl VoronoiApp {
             gif_status: GifStatus::None,
             gif_frame_count: 0,
             gif_palette: None,
+
+            preview_image: None,
         }
     }
 
@@ -726,7 +730,8 @@ impl VoronoiApp {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1284,39 +1289,70 @@ impl App for VoronoiApp {
         self.ensure_registered_texture(rs);
 
         // Run GPU pipeline
+        if let Some(img) = &self.preview_image {
+            // show image
+            let img = image::imageops::resize(
+                img,
+                self.size.0,
+                self.size.1,
+                image::imageops::FilterType::Nearest,
+            );
+            let rgba: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = img.convert();
+            let rgba = rgba.into_raw();
+            rs.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.color_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * self.size.0),
+                    rows_per_image: Some(self.size.1),
+                },
+                wgpu::Extent3d {
+                    width: self.size.0,
+                    height: self.size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        } else {
+            self.run_gpu(rs);
 
-        self.run_gpu(rs);
+            // Optionally animate seeds a bit
+            if self.animate {
+                if self.gif_status.is_recording() {
+                    for _ in 0..(60 / GIF_FRAMERATE) {
+                        self.sim.update(&mut self.seeds, self.size.0);
+                    }
 
-        // Optionally animate seeds a bit
-        if self.animate {
-            if self.gif_status.is_recording() {
-                for _ in 0..(60 / GIF_FRAMERATE) {
+                    if let Err(e) = self.write_frame_to_gif(device, &rs.queue) {
+                        self.gif_status = GifStatus::Error(e.to_string());
+                        self.animate = false;
+                    } else {
+                        self.gif_frame_count += 1;
+
+                        if self.gif_frame_count >= GIF_NUM_FRAMES {
+                            // finish recording
+                            // self.stop_recording_gif(device);
+                            if let GifStatus::Recording(Some(path)) = self.gif_status.clone() {
+                                self.gif_status = GifStatus::Complete(path);
+                            } else {
+                                self.gif_status =
+                                    GifStatus::Error("Something weird happened".into());
+                            }
+
+                            self.animate = false;
+                        }
+                    }
+                } else {
                     self.sim.update(&mut self.seeds, self.size.0);
                 }
-
-                if let Err(e) = self.write_frame_to_gif(device, &rs.queue) {
-                    self.gif_status = GifStatus::Error(e.to_string());
-                    self.animate = false;
-                } else {
-                    self.gif_frame_count += 1;
-
-                    if self.gif_frame_count >= GIF_NUM_FRAMES {
-                        // finish recording
-                        // self.stop_recording_gif(device);
-                        if let GifStatus::Recording(Some(path)) = self.gif_status.clone() {
-                            self.gif_status = GifStatus::Complete(path);
-                        } else {
-                            self.gif_status = GifStatus::Error("Something weird happened".into());
-                        }
-
-                        self.animate = false;
-                    }
-                }
-            } else {
-                self.sim.update(&mut self.seeds, self.size.0);
+                rs.queue
+                    .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
             }
-            rs.queue
-                .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
         }
 
         let dt = self.prev_frame_time.elapsed();
@@ -1400,11 +1436,18 @@ impl App for VoronoiApp {
                         std::thread::spawn({
                             let tx = self.progress_tx.clone();
                             let cancelled = self.process_cancelled.clone();
-                            move || match calculate::process(path, settings, tx.clone(), cancelled)
-                            {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    tx.send(ProgressMsg::Error(err.to_string())).ok();
+                            move || {
+                                let result = calculate::process_genetic(
+                                    path,
+                                    settings,
+                                    tx.clone(),
+                                    cancelled,
+                                );
+                                match result {
+                                    Ok(()) => {}
+                                    Err(err) => {
+                                        tx.send(ProgressMsg::Error(err.to_string())).ok();
+                                    }
                                 }
                             }
                         });
@@ -1423,6 +1466,7 @@ impl App for VoronoiApp {
                             if let Ok(msg) = self.progress_rx.try_recv() {
                                 match msg {
                                     ProgressMsg::Done(path) => {
+                                        self.preview_image = None;
                                         self.presets = get_presets();
                                         self.change_sim(device, path);
                                         self.animate = true;
@@ -1440,9 +1484,13 @@ impl App for VoronoiApp {
                                             ui.close();
                                         }
                                     }
+                                    ProgressMsg::UpdatePreview(image) => {
+                                        self.preview_image = Some(image);
+                                    }
                                     ProgressMsg::Cancelled => {
                                         self.process_cancelled
                                             .store(false, std::sync::atomic::Ordering::Relaxed);
+                                        self.preview_image = None;
                                         if self.quick_process {
                                             let settings = GenerationSettings::quick_process();
 
@@ -1451,7 +1499,7 @@ impl App for VoronoiApp {
                                                 let cancelled = self.process_cancelled.clone();
                                                 let path =
                                                     self.currently_processing.clone().unwrap();
-                                                move || match calculate::process(
+                                                move || match calculate::process_optimal(
                                                     path,
                                                     settings,
                                                     tx.clone(),
