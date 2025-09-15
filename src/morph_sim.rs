@@ -1,24 +1,92 @@
-use std::{fs, mem, path::PathBuf};
+use std::{fs, mem, path::PathBuf, time::Instant};
 
 use crate::{SeedColor, SeedPos};
 use image::GenericImageView;
-
-pub fn init_image(sidelen: u32, source_dir: PathBuf) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
+const DST_FORCE: f32 = 0.2;
+pub fn init_image(
+    sidelen: u32,
+    source: PathBuf,
+    get_assignments: bool,
+) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
     // load rust_output/source.png
-    let source = image::open(source_dir.join("source.png")).unwrap();
-    let assignments = fs::read_to_string(source_dir.join("assignments.json"))
-        .unwrap()
-        .strip_prefix('[')
-        .unwrap()
-        .strip_suffix(']')
-        .unwrap()
-        .split(',')
-        .map(|s| s.parse().unwrap())
-        .collect::<Vec<usize>>();
+    let (imgpath, assignments) = if get_assignments {
+        (
+            source.join("source.png"),
+            fs::read_to_string(source.join("assignments.json"))
+                .unwrap()
+                .strip_prefix('[')
+                .unwrap()
+                .strip_suffix(']')
+                .unwrap()
+                .split(',')
+                .map(|s| s.parse().unwrap())
+                .collect::<Vec<usize>>(),
+        )
+    } else {
+        (
+            source.clone(),
+            (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>(),
+        )
+    };
+
+    let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
+    let mut sim = Sim::new(source);
+    sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
+
+    sim.set_assignments(assignments, sidelen);
+    // for cell in &mut sim.cells {
+    //     cell.dst_force = 0.0;
+    // }
+    (seeds_n as u32, seeds, colors, sim)
+}
+
+pub const DRAWING_CANVAS_SIZE: usize = 128;
+
+// pub fn init_blank(sidelen: u32) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
+//     let mut seeds = Vec::new();
+//     let mut colors = Vec::new();
+
+//     let width = DRAWING_CANVAS_SIZE;
+//     let height = DRAWING_CANVAS_SIZE;
+
+//     assert_eq!(width, height);
+
+//     let seeds_n = width * height;
+//     let pixelsize = sidelen as f32 / width as f32;
+
+//     for y in 0..width {
+//         for x in 0..width {
+//             seeds.push(SeedPos {
+//                 xy: [(x as f32 + 0.5) * pixelsize, (y as f32 + 0.5) * pixelsize],
+//             });
+//             colors.push(SeedColor {
+//                 rgba: [1.0, 1.0, 1.0, 1.0],
+//             });
+//         }
+//     }
+
+//     let assignments = (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>();
+//     let mut sim = Sim::new(PathBuf::from("blank"));
+//     sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
+//     sim.set_assignments(assignments, sidelen);
+
+//     (seeds_n as u32, seeds, colors, sim)
+// }
+
+fn init_colors(sidelen: u32, imgpath: PathBuf) -> (Vec<SeedPos>, Vec<SeedColor>, usize) {
+    let mut source = image::open(imgpath).unwrap().to_rgb8();
+
+    if source.width() != source.height() || source.width() as u32 != DRAWING_CANVAS_SIZE as u32 {
+        source = image::imageops::resize(
+            &source,
+            DRAWING_CANVAS_SIZE as u32,
+            DRAWING_CANVAS_SIZE as u32,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
 
     let mut seeds = Vec::new();
     let mut colors = Vec::new();
-    let mut sim = Sim::new(source_dir);
 
     let width = source.width() as usize;
     let height = source.height() as usize;
@@ -44,30 +112,11 @@ pub fn init_image(sidelen: u32, source_dir: PathBuf) -> (u32, Vec<SeedPos>, Vec<
             });
         }
     }
-    sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
-
-    for (dst_idx, src_idx) in assignments.iter().enumerate() {
-        let src_x = (src_idx % width) as f32;
-        let src_y = (src_idx / width) as f32;
-        let dst_x = (dst_idx % width) as f32;
-        let dst_y = (dst_idx / width) as f32;
-
-        let dst_force = 0.13;
-
-        sim.cells[*src_idx] = CellBody::new(
-            (src_x + 0.5) * pixelsize,
-            (src_y + 0.5) * pixelsize,
-            (dst_x + 0.5) * pixelsize,
-            (dst_y + 0.5) * pixelsize,
-            dst_force,
-        );
-    }
-
-    (seeds_n as u32, seeds, colors, sim)
+    (seeds, colors, seeds_n)
 }
 
 #[derive(Clone, Copy)]
-struct CellBody {
+pub struct CellBody {
     srcx: f32,
     srcy: f32,
     dstx: f32,
@@ -80,6 +129,8 @@ struct CellBody {
     accy: f32,
 
     dst_force: f32,
+    age: u32,
+    stroke_id: u32,
 }
 
 const PERSONAL_SPACE: f32 = 0.95;
@@ -87,11 +138,7 @@ const MAX_VELOCITY: f32 = 6.0;
 const ALIGNMENT_FACTOR: f32 = 0.7;
 
 fn factor_curve(x: f32) -> f32 {
-    if x < 10.0 {
-        x * x * x
-    } else {
-        1000.0
-    }
+    (x * x * x).min(10.0)
 }
 
 impl CellBody {
@@ -106,7 +153,21 @@ impl CellBody {
             vely: 0.0,
             accx: 0.0,
             accy: 0.0,
+            age: 0,
+            stroke_id: 0,
         }
+    }
+
+    pub fn set_age(&mut self, age: u32) {
+        self.age = age;
+    }
+
+    pub fn set_dst_force(&mut self, force: f32) {
+        self.dst_force = force;
+    }
+
+    pub fn set_stroke_id(&mut self, stroke_id: u32) {
+        self.stroke_id = stroke_id;
     }
 
     fn update(&mut self, pos: &mut SeedPos) {
@@ -127,10 +188,17 @@ impl CellBody {
 
         pos.xy[0] += self.velx.clamp(-MAX_VELOCITY, MAX_VELOCITY);
         pos.xy[1] += self.vely.clamp(-MAX_VELOCITY, MAX_VELOCITY);
+
+        self.age += 1;
     }
 
-    fn apply_dst_force(&mut self, pos: &SeedPos, sidelen: f32, elapsed: f32) {
-        let factor = factor_curve(elapsed * self.dst_force);
+    fn apply_dst_force(&mut self, pos: &SeedPos, sidelen: f32) {
+        let elapsed = self.age as f32 / 60.0;
+        let factor = if self.dst_force == 0.0 {
+            0.1
+        } else {
+            factor_curve(elapsed * self.dst_force)
+        };
 
         let dx = self.dstx - pos.xy[0];
         let dy = self.dsty - pos.xy[1];
@@ -175,11 +243,16 @@ impl CellBody {
             self.accy -= (pos.xy[1] - (sidelen - personal_space)) / personal_space;
         }
     }
+
+    fn apply_stroke_attraction(&mut self, i: SeedPos, other_cell: SeedPos, weight: f32) {
+        self.accx += (other_cell.xy[0] - i.xy[0]) * weight * 0.8;
+        self.accy += (other_cell.xy[1] - i.xy[1]) * weight * 0.8;
+    }
 }
 
 pub struct Sim {
-    elapsed_frames: u32,
-    cells: Vec<CellBody>,
+    //elapsed_frames: u32,
+    pub cells: Vec<CellBody>,
     source: PathBuf,
 }
 
@@ -187,7 +260,7 @@ impl Sim {
     pub fn new(source_dir: PathBuf) -> Self {
         Self {
             cells: Vec::new(),
-            elapsed_frames: 0,
+            //elapsed_frames: 0,
             source: source_dir,
         }
     }
@@ -204,8 +277,8 @@ impl Sim {
         for cell in &mut self.cells {
             mem::swap(&mut cell.srcx, &mut cell.dstx);
             mem::swap(&mut cell.srcy, &mut cell.dsty);
+            cell.age = 0;
         }
-        self.elapsed_frames = 0;
     }
 
     pub fn update(&mut self, positions: &mut Vec<SeedPos>, sidelen: u32) {
@@ -227,11 +300,7 @@ impl Sim {
 
         for (i, cell) in self.cells.iter_mut().enumerate() {
             cell.apply_wall_force(&positions[i], sidelen as f32, pixel_size);
-            cell.apply_dst_force(
-                &positions[i],
-                sidelen as f32,
-                self.elapsed_frames as f32 / 60.0,
-            );
+            cell.apply_dst_force(&positions[i], sidelen as f32);
         }
 
         for i in 0..self.cells.len() {
@@ -264,6 +333,13 @@ impl Sim {
                             pixel_size,
                         );
 
+                        if self.cells[i].stroke_id == self.cells[*other].stroke_id
+                        // && self.cells[i].stroke_id != 0
+                        {
+                            // stronger attraction to same stroke
+                            self.cells[i].apply_stroke_attraction(positions[i], other_cell, weight);
+                        }
+
                         avg_xvel += self.cells[*other].velx * weight;
                         avg_yvel += self.cells[*other].vely * weight;
                         count += weight;
@@ -283,8 +359,30 @@ impl Sim {
         for (index, cell) in self.cells.iter_mut().enumerate() {
             cell.update(&mut positions[index]);
         }
+    }
 
-        self.elapsed_frames += 1;
+    pub fn set_assignments(&mut self, assignments: Vec<usize>, sidelen: u32) {
+        let width = (self.cells.len() as f32).sqrt();
+        let pixelsize = sidelen as f32 / width;
+
+        for (dst_idx, src_idx) in assignments.iter().enumerate() {
+            let src_x = (src_idx % width as usize) as f32;
+            let src_y = (src_idx / width as usize) as f32;
+            let dst_x = (dst_idx % width as usize) as f32;
+            let dst_y = (dst_idx / width as usize) as f32;
+            let prev = self.cells[*src_idx];
+
+            self.cells[*src_idx] = CellBody::new(
+                (src_x + 0.5) * pixelsize,
+                (src_y + 0.5) * pixelsize,
+                (dst_x + 0.5) * pixelsize,
+                (dst_y + 0.5) * pixelsize,
+                prev.dst_force,
+            );
+
+            self.cells[*src_idx].age = prev.age;
+            self.cells[*src_idx].stroke_id = prev.stroke_id;
+        }
     }
 }
 

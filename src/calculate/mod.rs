@@ -10,6 +10,8 @@ use pathfinding::prelude::Weights;
 use rand::Rng;
 use std::sync::mpsc;
 
+use crate::{morph_sim::DRAWING_CANVAS_SIZE, PixelData, SeedColor};
+
 pub struct GenerationSettings {
     proximity_importance: i64,
     rescale: Option<u32>,
@@ -18,7 +20,7 @@ pub struct GenerationSettings {
 impl GenerationSettings {
     pub fn default() -> Self {
         Self {
-            proximity_importance: 20,
+            proximity_importance: 10, // 20
             rescale: None,
         }
     }
@@ -92,6 +94,7 @@ impl Weights<i64> for ImgDiffWeights {
 pub enum ProgressMsg {
     Progress(f32),
     UpdatePreview(image::ImageBuffer<image::Rgb<u8>, Vec<u8>>),
+    UpdateAssignments(Vec<usize>),
     Done(PathBuf), // result directory
     Error(String),
     Cancelled,
@@ -304,6 +307,46 @@ fn get_images<P: AsRef<Path>>(
     ),
     Box<dyn Error>,
 > {
+    let (target, target_pixels, weights) = load_target(settings)?;
+
+    let base_name = source_path
+        .as_ref()
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let source = image::open(source_path)?.to_rgb8();
+    let source = image::imageops::resize(
+        &source,
+        target.width(),
+        target.height(),
+        image::imageops::FilterType::Lanczos3,
+    );
+    let source_pixels = source
+        .pixels()
+        .map(|p| (p[0], p[1], p[2]))
+        .collect::<Vec<_>>();
+    Ok((
+        target,
+        base_name,
+        source,
+        source_pixels,
+        target_pixels,
+        weights,
+    ))
+}
+
+fn load_target(
+    settings: &GenerationSettings,
+) -> Result<
+    (
+        image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+        Vec<(u8, u8, u8)>,
+        Vec<i64>,
+    ),
+    Box<dyn Error>,
+> {
     let mut target = image::open(TARGET_IMAGE_PATH)?.to_rgb8();
     let mut target_weights = image::open(TARGET_WEIGHTS_PATH)?.to_rgb8();
     if target.dimensions().0 != target.dimensions().1 {
@@ -326,52 +369,21 @@ fn get_images<P: AsRef<Path>>(
             image::imageops::FilterType::Lanczos3,
         );
     }
-    let base_name = source_path
-        .as_ref()
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let source = image::open(source_path)?.to_rgb8();
-    let source = image::imageops::resize(
-        &source,
-        target.width(),
-        target.height(),
-        image::imageops::FilterType::Lanczos3,
-    );
-    let source_pixels = source
-        .pixels()
-        .map(|p| (p[0], p[1], p[2]))
-        .collect::<Vec<_>>();
     let target_pixels = target.pixels().map(|p| (p[0], p[1], p[2])).collect();
     let weights = load_weights(&target_weights.into());
-    Ok((
-        target,
-        base_name,
-        source,
-        source_pixels,
-        target_pixels,
-        weights,
-    ))
+    Ok((target, target_pixels, weights))
 }
 
 #[derive(Clone, Copy)]
 struct Pixel {
     src_x: u16,
     src_y: u16,
-    rgb: (u8, u8, u8),
     h: i64, // current heuristic value
 }
 
 impl Pixel {
-    fn new(src_x: u16, src_y: u16, rgb: (u8, u8, u8), h: i64) -> Self {
-        Self {
-            src_x,
-            src_y,
-            rgb,
-            h,
-        }
+    fn new(src_x: u16, src_y: u16, h: i64) -> Self {
+        Self { src_x, src_y, h }
     }
 
     fn update_heuristic(&mut self, new_h: i64) {
@@ -384,12 +396,21 @@ impl Pixel {
         target_pos: (u16, u16),
         target_col: (u8, u8, u8),
         weight: i64,
+        colors: &[SeedColor],
         proximity_importance: i64,
     ) -> i64 {
         heuristic(
             (self.src_x, self.src_y),
             target_pos,
-            self.rgb,
+            {
+                let rgba =
+                    colors[self.src_y as usize * DRAWING_CANVAS_SIZE + self.src_x as usize].rgba;
+                (
+                    (rgba[0] * 256.0) as u8,
+                    (rgba[1] * 256.0) as u8,
+                    (rgba[2] * 256.0) as u8,
+                )
+            },
             target_col,
             weight,
             proximity_importance,
@@ -397,49 +418,129 @@ impl Pixel {
     }
 }
 
+const STROKE_REWARD: i64 = -10000000000;
+
+fn stroke_reward(
+    newpos: usize,
+    oldpos: usize,
+    pixel_data: &[PixelData],
+    pixels: &[Pixel],
+    frame_count: u32,
+) -> i64 {
+    let x = (newpos % DRAWING_CANVAS_SIZE) as u16;
+    let y = (newpos / DRAWING_CANVAS_SIZE) as u16;
+    // look at 8-connected neighbors
+    // if any has the same stroke_id, return true
+    let data = pixel_data
+        [pixels[oldpos].src_x as usize + pixels[oldpos].src_y as usize * DRAWING_CANVAS_SIZE];
+    let stroke_id = data.stroke_id;
+    let age = frame_count - data.last_edited;
+
+    for (dx, dy) in [
+        //(-1, -1),
+        (0, -1),
+        //(1, -1),
+        (-1, 0),
+        (1, 0),
+        //(-1, 1),
+        (0, 1),
+        //(1, 1),
+    ] {
+        let nx = x as i16 + dx;
+        let ny = y as i16 + dy;
+        if nx < 0 || nx >= DRAWING_CANVAS_SIZE as i16 || ny < 0 || ny >= DRAWING_CANVAS_SIZE as i16
+        {
+            continue;
+        }
+        let npos = ny as usize * DRAWING_CANVAS_SIZE + nx as usize;
+        if pixel_data
+            [pixels[npos].src_x as usize + pixels[npos].src_y as usize * DRAWING_CANVAS_SIZE]
+            .stroke_id
+            == stroke_id
+        {
+            return STROKE_REWARD;
+        }
+    }
+    0
+}
+
 const GENERATIONS: usize = 100;
-const SWAPS_PER_GENERATION: usize = 50000;
+const SWAPS_PER_GENERATION: usize = 130000;
+const MAX_STROKES: usize = 2048;
 
 pub fn process_genetic<P: AsRef<Path>>(
     source_path: P,
     settings: GenerationSettings,
     tx: mpsc::SyncSender<ProgressMsg>,
     cancelled: Arc<AtomicBool>,
+    colors: Arc<std::sync::RwLock<Vec<crate::SeedColor>>>,
+    pixel_data: Arc<std::sync::RwLock<Vec<PixelData>>>,
+    frame_count: u32,
 ) -> Result<(), Box<dyn Error>> {
     let (target, base_name, source, source_pixels, target_pixels, weights) =
         get_images(source_path, &settings)?;
 
-    let mut pixels = source_pixels
-        .iter()
-        .enumerate()
-        .map(|(i, &(r, g, b))| {
-            let x = (i as u32 % source.width()) as u16;
-            let y = (i as u32 / source.width()) as u16;
-            let mut p = Pixel::new(x, y, (r, g, b), 0);
-            let h = p.calc_heuristic(
-                (x, y),
-                target_pixels[i],
-                weights[i],
-                settings.proximity_importance,
-            );
-            p.update_heuristic(h);
-            p
-        })
-        .collect::<Vec<_>>();
+    let mut pixels = {
+        let read_colors: Vec<SeedColor> = colors.read().unwrap().clone();
+        //let read_pixel_data: Vec<PixelData> = pixel_data.read().unwrap().clone();
+
+        source_pixels
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let x = (i as u32 % source.width()) as u16;
+                let y = (i as u32 / source.width()) as u16;
+                let mut p = Pixel::new(x, y, 0);
+                let h = p.calc_heuristic(
+                    (x, y),
+                    target_pixels[i],
+                    weights[i],
+                    &read_colors,
+                    settings.proximity_importance,
+                    // &read_pixel_data,
+                ) + STROKE_REWARD;
+                p.update_heuristic(h);
+                p
+            })
+            .collect::<Vec<_>>()
+    };
 
     let mut rng = rand::thread_rng();
-    let mut max_dist = target.width() / 6;
+    fn max_dist(age: u32) -> u32 {
+        (((DRAWING_CANVAS_SIZE / 4) as f32) * (0.99f32).powi(age as i32 / 30)).round() as u32
+    }
+
     loop {
+        let colors: Vec<SeedColor> = {
+            let r = colors.read().unwrap();
+            r.clone()
+        };
+        let pixel_data = {
+            let r = pixel_data.read().unwrap();
+            r.clone()
+        };
         let mut swaps_made = 0;
+
         for _ in 0..SWAPS_PER_GENERATION {
             let apos = rng.gen_range(0..pixels.len());
             let ax = apos as u16 % target.width() as u16;
             let ay = apos as u16 / target.width() as u16;
-            let bx = (ax as i16 + rng.gen_range(-(max_dist as i16)..=(max_dist as i16)))
+
+            //let stroke_id = pixel_data[apos].stroke_id as usize;
+            let max_dist_a = max_dist(frame_count.saturating_sub(pixel_data[apos].last_edited));
+
+            let bx = (ax as i16 + rng.gen_range(-(max_dist_a as i16)..=(max_dist_a as i16)))
                 .clamp(0, target.width() as i16 - 1) as u16;
-            let by = (ay as i16 + rng.gen_range(-(max_dist as i16)..=(max_dist as i16)))
+            let by = (ay as i16 + rng.gen_range(-(max_dist_a as i16)..=(max_dist_a as i16)))
                 .clamp(0, target.width() as i16 - 1) as u16;
             let bpos = by as usize * target.width() as usize + bx as usize;
+
+            let max_dist_b = max_dist(frame_count.saturating_sub(pixel_data[bpos].last_edited));
+            if (bx as i32 - ax as i32).abs() > max_dist_b as i32
+                || (by as i32 - ay as i32).abs() > max_dist_b as i32
+            {
+                continue;
+            }
 
             let t_a = target_pixels[apos];
             let t_b = target_pixels[bpos];
@@ -448,15 +549,17 @@ pub fn process_genetic<P: AsRef<Path>>(
                 (bx, by),
                 t_b,
                 weights[bpos],
+                &colors,
                 settings.proximity_importance,
-            );
+            ) + stroke_reward(bpos, apos, &pixel_data, &pixels, frame_count);
 
             let b_on_a_h = pixels[bpos].calc_heuristic(
                 (ax, ay),
                 t_a,
                 weights[apos],
+                &colors,
                 settings.proximity_importance,
-            );
+            ) + stroke_reward(apos, bpos, &pixel_data, &pixels, frame_count);
 
             let improvement_a = pixels[apos].h - b_on_a_h;
             let improvement_b = pixels[bpos].h - a_on_b_h;
@@ -468,22 +571,32 @@ pub fn process_genetic<P: AsRef<Path>>(
                 swaps_made += 1;
             }
         }
-        let assignments = pixels
-            .iter()
-            .map(|p| p.src_y as usize * source.width() as usize + p.src_x as usize)
-            .collect::<Vec<_>>();
-        let img = make_new_img(&source_pixels, &assignments, target.width());
-        if swaps_made < 10 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            let dir_name = save_result(target, base_name, source, assignments, img)?;
-            tx.send(ProgressMsg::Done(PathBuf::from(format!(
-                "./presets/{}",
-                dir_name
-            ))))?;
+
+        //println!("swaps made: {}", swaps_made);
+
+        // let img = make_new_img(&source_pixels, &assignments, target.width());
+        // if swaps_made < 10 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        //     let dir_name = save_result(target, base_name, source, assignments, img)?;
+        //     tx.send(ProgressMsg::Done(PathBuf::from(format!(
+        //         "./presets/{}",
+        //         dir_name
+        //     ))))?;
+        //     return Ok(());
+        // }
+        // tx.send(ProgressMsg::UpdatePreview(img))?;
+        if swaps_made > 0 {
+            let assignments = pixels
+                .iter()
+                .map(|p| p.src_y as usize * source.width() as usize + p.src_x as usize)
+                .collect::<Vec<_>>();
+            tx.send(ProgressMsg::UpdateAssignments(assignments))?;
+        }
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            tx.send(ProgressMsg::Cancelled).unwrap();
             return Ok(());
         }
-        tx.send(ProgressMsg::UpdatePreview(img))?;
 
-        max_dist = (max_dist as f32 * 0.99).max(4.0) as u32;
+        //max_dist = (max_dist as f32 * 0.99).max(4.0) as u32;
     }
 }
 fn load_weights(source: &image::DynamicImage) -> Vec<i64> {
