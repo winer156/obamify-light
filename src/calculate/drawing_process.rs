@@ -5,6 +5,7 @@ use super::SWAPS_PER_GENERATION;
 use std::error::Error;
 
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -131,10 +132,11 @@ pub fn drawing_process_genetic<P: AsRef<Path>>(
     source_path: P,
     settings: GenerationSettings,
     tx: mpsc::SyncSender<ProgressMsg>,
-    cancelled: Arc<AtomicBool>,
     colors: Arc<std::sync::RwLock<Vec<crate::SeedColor>>>,
     pixel_data: Arc<std::sync::RwLock<Vec<PixelData>>>,
     frame_count: u32,
+    my_id: u32,
+    current_id: Arc<AtomicU32>,
 ) -> Result<(), Box<dyn Error>> {
     let (target, base_name, source, source_pixels, target_pixels, weights) =
         crate::calculate::util::get_images(source_path, &settings)?;
@@ -250,7 +252,7 @@ pub fn drawing_process_genetic<P: AsRef<Path>>(
                 .collect::<Vec<_>>();
             tx.send(ProgressMsg::UpdateAssignments(assignments))?;
         }
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        if my_id != current_id.load(std::sync::atomic::Ordering::Relaxed) {
             tx.send(ProgressMsg::Cancelled).unwrap();
             return Ok(());
         }

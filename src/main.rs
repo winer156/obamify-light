@@ -5,7 +5,10 @@ use std::{
     fs::File,
     num::NonZeroU64,
     path::PathBuf,
-    sync::{atomic::AtomicBool, mpsc, Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        mpsc, Arc, RwLock,
+    },
 };
 
 use bytemuck::{Pod, Zeroable};
@@ -152,14 +155,20 @@ pub struct VoronoiApp {
     frame_count: u32,
 
     gui: GuiState,
+    current_drawing_id: Arc<AtomicU32>,
 }
 
 impl VoronoiApp {
-    pub fn change_sim(&mut self, device: &wgpu::Device, source: PathBuf) {
-        let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source);
+    fn apply_sim_init(
+        &mut self,
+        device: &wgpu::Device,
+        seed_count: u32,
+        seeds: Vec<SeedPos>,
+        colors: Vec<SeedColor>,
+        sim: Sim,
+    ) {
         self.seed_count = seed_count;
         self.seeds = seeds;
-
         self.sim = sim;
 
         // Update GPU buffers
@@ -191,6 +200,16 @@ impl VoronoiApp {
         *self.pixeldata.write().unwrap() = PixelData::init_canvas(self.frame_count);
 
         self.rebuild_bind_groups(device);
+    }
+
+    pub fn change_sim(&mut self, device: &wgpu::Device, source: PathBuf) {
+        let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source);
+        self.apply_sim_init(device, seed_count, seeds, colors, sim);
+    }
+
+    pub fn canvas_sim(&mut self, device: &wgpu::Device, source: PathBuf) {
+        let (seed_count, seeds, colors, sim) = morph_sim::init_canvas(self.size.0, source);
+        self.apply_sim_init(device, seed_count, seeds, colors, sim);
     }
 
     pub fn new(cc: &CreationContext<'_>) -> Self {
@@ -673,6 +692,7 @@ impl VoronoiApp {
             stroke_count: 0,
             gui: GuiState::default(presets),
             frame_count: 0,
+            current_drawing_id: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -1352,6 +1372,44 @@ impl VoronoiApp {
             self.gui.last_mouse_pos = None;
         }
     }
+
+    fn init_canvas(&mut self, device: &wgpu::Device) {
+        let path = std::path::PathBuf::from("./blank.png");
+
+        let settings = GenerationSettings::default();
+        self.canvas_sim(device, path.clone());
+        self.gui.animate = true;
+
+        self.current_drawing_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        std::thread::spawn({
+            let tx = self.progress_tx.clone();
+            let colors = Arc::clone(&self.colors);
+            let pixel_data = Arc::clone(&self.pixeldata);
+            let frame_count = self.frame_count;
+            let current_id = self.current_drawing_id.clone();
+            let my_id = current_id.load(std::sync::atomic::Ordering::SeqCst);
+            move || {
+                let result = calculate::drawing_process::drawing_process_genetic(
+                    path,
+                    settings,
+                    tx.clone(),
+                    colors,
+                    pixel_data,
+                    frame_count,
+                    my_id,
+                    current_id,
+                );
+                match result {
+                    Ok(()) => {}
+                    Err(err) => {
+                        tx.send(ProgressMsg::Error(err.to_string())).ok();
+                    }
+                }
+            }
+        });
+    }
 }
 
 const DRAWING_ALPHA: f32 = 0.5;
@@ -1530,40 +1588,7 @@ impl App for VoronoiApp {
                 match self.gui.mode {
                     GuiMode::Draw => {
                         if ui.button("reset").clicked() {
-                            let path = std::path::PathBuf::from("./blank.png");
-
-                            self.gui.show_progress_modal = true;
-                            self.gui.quick_process = false;
-
-                            let settings = GenerationSettings::default();
-                            todo!(); //self.change_sim(device, path.clone(), false);
-                            self.gui.animate = true;
-
-                            std::thread::spawn({
-                                let tx = self.progress_tx.clone();
-                                let cancelled = self.gui.process_cancelled.clone();
-                                let colors = Arc::clone(&self.colors);
-                                let pixel_data = Arc::clone(&self.pixeldata);
-                                let frame_count = self.frame_count;
-                                move || {
-                                    let result =
-                                        calculate::drawing_process::drawing_process_genetic(
-                                            path,
-                                            settings,
-                                            tx.clone(),
-                                            cancelled,
-                                            colors,
-                                            pixel_data,
-                                            frame_count,
-                                        );
-                                    match result {
-                                        Ok(()) => {}
-                                        Err(err) => {
-                                            tx.send(ProgressMsg::Error(err.to_string())).ok();
-                                        }
-                                    }
-                                }
-                            });
+                            self.init_canvas(device);
                         }
 
                         if let Ok(msg) = self.progress_rx.try_recv() {
@@ -1576,7 +1601,7 @@ impl App for VoronoiApp {
                                         .process_cancelled
                                         .store(false, std::sync::atomic::Ordering::Relaxed);
                                     self.preview_image = None;
-                                    self.gui.show_progress_modal = false;
+
                                     ui.close();
                                 }
                                 ProgressMsg::UpdateAssignments(assignments) => {
@@ -1586,6 +1611,15 @@ impl App for VoronoiApp {
                                 ProgressMsg::Done(path_buf) => todo!(),
                                 ProgressMsg::Error(_) => todo!(),
                             }
+                        }
+
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("🏠")))
+                            .on_hover_text("transform mode")
+                            .clicked()
+                        {
+                            self.gui.mode = GuiMode::Transform;
+                            self.change_sim(device, self.gui.presets[0].clone());
                         }
                     }
                     GuiMode::Transform => {
@@ -1648,7 +1682,7 @@ impl App for VoronoiApp {
                                     }
                                 }
                             });
-                        ui.separator();
+
                         if ui.button("obamify new image").clicked() {
                             // open file select
                             let file = rfd::FileDialog::new()
@@ -1682,6 +1716,17 @@ impl App for VoronoiApp {
                                     }
                                 });
                             }
+                        }
+
+                        ui.separator();
+
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("✏")))
+                            .on_hover_text("drawing mode")
+                            .clicked()
+                        {
+                            self.gui.mode = GuiMode::Draw;
+                            self.init_canvas(device);
                         }
 
                         if self.gui.show_progress_modal {
