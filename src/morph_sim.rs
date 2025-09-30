@@ -3,87 +3,44 @@ use std::{fs, mem, path::PathBuf, time::Instant};
 use crate::{SeedColor, SeedPos};
 use image::GenericImageView;
 const DST_FORCE: f32 = 0.2;
-pub fn init_image(
-    sidelen: u32,
-    source: PathBuf,
-    get_assignments: bool,
-) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
-    // load rust_output/source.png
-    let (imgpath, assignments) = if get_assignments {
-        (
-            source.join("source.png"),
-            fs::read_to_string(source.join("assignments.json"))
-                .unwrap()
-                .strip_prefix('[')
-                .unwrap()
-                .strip_suffix(']')
-                .unwrap()
-                .split(',')
-                .map(|s| s.parse().unwrap())
-                .collect::<Vec<usize>>(),
-        )
-    } else {
-        (
-            source.clone(),
-            (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>(),
-        )
-    };
+pub fn init_image(sidelen: u32, source: PathBuf) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
+    let imgpath = source.join("source.png");
+    let assignments = fs::read_to_string(source.join("assignments.json"))
+        .unwrap()
+        .strip_prefix('[')
+        .unwrap()
+        .strip_suffix(']')
+        .unwrap()
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect::<Vec<usize>>();
 
     let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
     let mut sim = Sim::new(source);
     sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
 
     sim.set_assignments(assignments, sidelen);
-    // for cell in &mut sim.cells {
-    //     cell.dst_force = 0.0;
-    // }
+    for cell in &mut sim.cells {
+        cell.dst_force = 0.14;
+    }
     (seeds_n as u32, seeds, colors, sim)
 }
 
-pub const DRAWING_CANVAS_SIZE: usize = 128;
+pub fn init_canvas(sidelen: u32, source: PathBuf) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
+    use crate::calculate::drawing_process::DRAWING_CANVAS_SIZE;
+    let imgpath = source.clone();
+    let assignments = (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>();
 
-// pub fn init_blank(sidelen: u32) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
-//     let mut seeds = Vec::new();
-//     let mut colors = Vec::new();
+    let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
+    let mut sim = Sim::new(source);
+    sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
 
-//     let width = DRAWING_CANVAS_SIZE;
-//     let height = DRAWING_CANVAS_SIZE;
-
-//     assert_eq!(width, height);
-
-//     let seeds_n = width * height;
-//     let pixelsize = sidelen as f32 / width as f32;
-
-//     for y in 0..width {
-//         for x in 0..width {
-//             seeds.push(SeedPos {
-//                 xy: [(x as f32 + 0.5) * pixelsize, (y as f32 + 0.5) * pixelsize],
-//             });
-//             colors.push(SeedColor {
-//                 rgba: [1.0, 1.0, 1.0, 1.0],
-//             });
-//         }
-//     }
-
-//     let assignments = (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>();
-//     let mut sim = Sim::new(PathBuf::from("blank"));
-//     sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
-//     sim.set_assignments(assignments, sidelen);
-
-//     (seeds_n as u32, seeds, colors, sim)
-// }
+    sim.set_assignments(assignments, sidelen);
+    (seeds_n as u32, seeds, colors, sim)
+}
 
 fn init_colors(sidelen: u32, imgpath: PathBuf) -> (Vec<SeedPos>, Vec<SeedColor>, usize) {
     let mut source = image::open(imgpath).unwrap().to_rgb8();
-
-    if source.width() != source.height() || source.width() as u32 != DRAWING_CANVAS_SIZE as u32 {
-        source = image::imageops::resize(
-            &source,
-            DRAWING_CANVAS_SIZE as u32,
-            DRAWING_CANVAS_SIZE as u32,
-            image::imageops::FilterType::Lanczos3,
-        );
-    }
 
     let mut seeds = Vec::new();
     let mut colors = Vec::new();

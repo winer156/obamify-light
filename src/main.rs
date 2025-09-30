@@ -11,14 +11,14 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use color_quant::NeuQuant;
 use eframe::{egui, App, CreationContext, Frame, NativeOptions};
-use egui::{frame, Color32, Modal, ViewportBuilder};
+use egui::{frame, Color32, Modal, ViewportBuilder, Window};
 use egui_wgpu::{self, wgpu};
 use image::buffer::ConvertBuffer;
 use wgpu::util::DeviceExt;
 
 use crate::{
-    calculate::{GenerationSettings, ProgressMsg},
-    morph_sim::{preset_path_to_name, Sim, DRAWING_CANVAS_SIZE},
+    calculate::{drawing_process::PixelData, GenerationSettings, ProgressMsg},
+    morph_sim::{preset_path_to_name, Sim},
 };
 
 const WG_SIZE_XY: u32 = 8;
@@ -37,12 +37,6 @@ pub struct SeedPos {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SeedColor {
     rgba: [f32; 4],
-}
-
-#[derive(Clone, Copy)]
-pub struct PixelData {
-    pub stroke_id: u32,
-    pub last_edited: u32,
 }
 
 #[repr(C)]
@@ -70,7 +64,7 @@ const GIF_NUM_FRAMES: u32 = 140;
 const GIF_SPEED: f32 = 1.5;
 const GIF_PALETTE_SAMPLEFAC: i32 = 1;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum GifStatus {
     None,
     Recording(Option<PathBuf>),
@@ -79,18 +73,17 @@ enum GifStatus {
 }
 impl GifStatus {
     fn is_recording(&self) -> bool {
-        match self {
-            GifStatus::Recording(_) => true,
-            _ => false,
-        }
+        matches!(self, GifStatus::Recording(_))
     }
 
     fn not_recording(&self) -> bool {
-        match self {
-            GifStatus::None => true,
-            _ => false,
-        }
+        matches!(self, GifStatus::None)
     }
+}
+
+pub enum GuiMode {
+    Transform,
+    Draw,
 }
 
 pub struct VoronoiApp {
@@ -98,17 +91,9 @@ pub struct VoronoiApp {
     // UI state
     size: (u32, u32),
     seed_count: u32,
-    animate: bool,
-    fps_text: String,
-    show_progress_modal: bool,
+
     progress_tx: mpsc::SyncSender<ProgressMsg>,
     progress_rx: mpsc::Receiver<ProgressMsg>,
-    last_progress: f32,
-    process_cancelled: Arc<AtomicBool>,
-    quick_process: bool,
-    currently_processing: Option<PathBuf>,
-
-    presets: Vec<PathBuf>,
 
     gif_status: GifStatus,
     gif_encoder: Option<gif::Encoder<File>>,
@@ -161,17 +146,17 @@ pub struct VoronoiApp {
     jfa_bg_b_to_a: wgpu::BindGroup,
     shade_bg: wgpu::BindGroup,
     preview_image: Option<image::ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
-    last_mouse_pos: Option<(f32, f32)>,
-    drawing_color: [f32; 4],
+
     stroke_count: u32,
 
     frame_count: u32,
+
+    gui: GuiState,
 }
 
 impl VoronoiApp {
-    pub fn change_sim(&mut self, device: &wgpu::Device, source: PathBuf, get_assignments: bool) {
-        let (seed_count, seeds, colors, sim) =
-            morph_sim::init_image(self.size.0, source, get_assignments);
+    pub fn change_sim(&mut self, device: &wgpu::Device, source: PathBuf) {
+        let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source);
         self.seed_count = seed_count;
         self.seeds = seeds;
 
@@ -203,13 +188,7 @@ impl VoronoiApp {
         });
 
         *self.colors.write().unwrap() = colors;
-        *self.pixeldata.write().unwrap() = vec![
-            PixelData {
-                stroke_id: 0,
-                last_edited: self.frame_count,
-            };
-            (DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE) as usize
-        ];
+        *self.pixeldata.write().unwrap() = PixelData::init_canvas(self.frame_count);
 
         self.rebuild_bind_groups(device);
     }
@@ -258,7 +237,6 @@ impl VoronoiApp {
         let (seed_count, seeds, colors, sim) = morph_sim::init_image(
             size.0,
             presets[rand::random::<usize>() % presets.len()].clone(),
-            true,
         );
 
         // === Buffers ===
@@ -650,18 +628,10 @@ impl VoronoiApp {
         Self {
             size,
             seed_count,
-            animate: true,
-            fps_text: String::new(),
+
             seeds,
             colors: Arc::new(RwLock::new(colors)),
-            pixeldata: Arc::new(RwLock::new(vec![
-                PixelData {
-                    stroke_id: 0,
-                    last_edited: 0
-                };
-                (DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)
-                    as usize
-            ])),
+            pixeldata: Arc::new(RwLock::new(PixelData::init_canvas(0))),
             egui_tex_id: None,
             seed_buf,
             color_buf,
@@ -689,15 +659,9 @@ impl VoronoiApp {
             jfa_bg_b_to_a,
             shade_bg,
             prev_frame_time: std::time::Instant::now(),
-            presets,
 
             progress_tx,
             progress_rx,
-            show_progress_modal: false,
-            last_progress: 0.0,
-            process_cancelled: Arc::new(AtomicBool::new(false)),
-            quick_process: false,
-            currently_processing: None,
 
             gif_encoder: None,
             gif_status: GifStatus::None,
@@ -705,10 +669,9 @@ impl VoronoiApp {
             gif_palette: None,
 
             preview_image: None,
-            last_mouse_pos: None,
-            drawing_color: [0.0, 0.0, 0.0, DRAWING_ALPHA],
-            stroke_count: 0,
 
+            stroke_count: 0,
+            gui: GuiState::default(presets),
             frame_count: 0,
         }
     }
@@ -1120,7 +1083,7 @@ impl VoronoiApp {
         let bpp = 4u32; // RGBA8
         let unpadded_bytes_per_row = width * bpp;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256
-        let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
         let buffer_size = padded_bytes_per_row as u64 * height as u64;
 
         // Staging buffer to receive the texture
@@ -1210,54 +1173,54 @@ impl VoronoiApp {
         // let rgba = resized.into_raw();
 
         // if first frame, create encoder
-        // if self.gif_status.is_recording() && self.gif_encoder.is_none() {
-        //     let file = rfd::FileDialog::new()
-        //         .set_title("save gif")
-        //         .add_filter("gif", &["gif"])
-        //         .set_file_name(format!("{}.gif", self.sim.name()))
-        //         .save_file();
-        //     if let Some(path) = file {
-        //         let colors = self
-        //             .colors
-        //             .read()
-        //             .unwrap()
-        //             .iter()
-        //             .flat_map(|s| s.rgba.map(|f| (f * 256.0) as u8))
-        //             .collect::<Vec<u8>>();
-        //         let gif_palette = NeuQuant::new(GIF_PALETTE_SAMPLEFAC, 256, &colors);
+        if self.gif_status.is_recording() && self.gif_encoder.is_none() {
+            let file = rfd::FileDialog::new()
+                .set_title("save gif")
+                .add_filter("gif", &["gif"])
+                .set_file_name(format!("{}.gif", self.sim.name()))
+                .save_file();
+            if let Some(path) = file {
+                let colors = self
+                    .colors
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| s.rgba.map(|f| (f * 256.0) as u8))
+                    .collect::<Vec<u8>>();
+                let gif_palette = NeuQuant::new(GIF_PALETTE_SAMPLEFAC, 256, &colors);
 
-        //         let file = std::fs::File::create(&path)?;
-        //         // save a test image of the palette
-        //         // {
-        //         //     let mut img = image::ImageBuffer::new(16, 16);
-        //         //     for (i, pixel) in gif_palette.color_map_rgb().chunks_exact(3).enumerate() {
-        //         //         img.put_pixel(
-        //         //             i as u32 % 16,
-        //         //             i as u32 / 16,
-        //         //             image::Rgba([pixel[0], pixel[1], pixel[2], 255]),
-        //         //         );
-        //         //     }
-        //         //     img.save("palette.png")?;
-        //         // }
-        //         // clear file
-        //         file.set_len(0)?;
-        //         let mut encoder = gif::Encoder::new(
-        //             file,
-        //             GIF_RESOLUTION as u16,
-        //             GIF_RESOLUTION as u16,
-        //             &gif_palette.color_map_rgb(),
-        //         )?;
-        //         self.gif_palette = Some(gif_palette);
-        //         encoder.set_repeat(gif::Repeat::Infinite)?;
-        //         self.gif_encoder = Some(encoder);
-        //         self.gif_frame_count = 0;
-        //         self.gif_status = GifStatus::Recording(Some(path));
-        //     } else {
-        //         // cancelled
-        //         self.stop_recording_gif(device);
-        //         return Ok(());
-        //     }
-        // }
+                let file = std::fs::File::create(&path)?;
+                // save a test image of the palette
+                // {
+                //     let mut img = image::ImageBuffer::new(16, 16);
+                //     for (i, pixel) in gif_palette.color_map_rgb().chunks_exact(3).enumerate() {
+                //         img.put_pixel(
+                //             i as u32 % 16,
+                //             i as u32 / 16,
+                //             image::Rgba([pixel[0], pixel[1], pixel[2], 255]),
+                //         );
+                //     }
+                //     img.save("palette.png")?;
+                // }
+                // clear file
+                file.set_len(0)?;
+                let mut encoder = gif::Encoder::new(
+                    file,
+                    GIF_RESOLUTION as u16,
+                    GIF_RESOLUTION as u16,
+                    &gif_palette.color_map_rgb(),
+                )?;
+                self.gif_palette = Some(gif_palette);
+                encoder.set_repeat(gif::Repeat::Infinite)?;
+                self.gif_encoder = Some(encoder);
+                self.gif_frame_count = 0;
+                self.gif_status = GifStatus::Recording(Some(path));
+            } else {
+                // cancelled
+                self.stop_recording_gif(device);
+                return Ok(());
+            }
+        }
 
         if let Some(encoder) = &mut self.gif_encoder {
             let nq = self.gif_palette.as_ref().unwrap();
@@ -1282,9 +1245,9 @@ impl VoronoiApp {
     fn stop_recording_gif(&mut self, device: &wgpu::Device) {
         self.gif_status = GifStatus::None;
         self.gif_encoder = None;
-        self.animate = false;
+        self.gui.animate = false;
         self.resize_textures(device, (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION), false);
-        self.change_sim(device, self.sim.source_path(), true);
+        self.change_sim(device, self.sim.source_path());
     }
 
     fn draw(
@@ -1317,14 +1280,14 @@ impl VoronoiApp {
                 mousepos.0,
                 mousepos.1,
             );
-            let thickness = if self.drawing_color == [0.0, 0.0, 0.0, DRAWING_ALPHA] {
+            let thickness = if self.gui.drawing_color == [0.0, 0.0, 0.0, DRAWING_ALPHA] {
                 30.0
             } else {
                 50.0
             };
             let transition = 10.0;
             if dist < thickness + transition {
-                let color = self.drawing_color;
+                let color = self.gui.drawing_color;
                 let alpha =
                     ((thickness + transition - dist) / transition).clamp(0.0, 1.0) * color[3];
                 let blend = |c1: f32, c2: f32, a: f32| (1.0 - a) * c1 + a * c2;
@@ -1351,7 +1314,46 @@ impl VoronoiApp {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
     }
+
+    fn handle_drawing(
+        &mut self,
+        ctx: &egui::Context,
+        device: &wgpu::Device,
+        ui: &mut egui::Ui,
+        aspect: f32,
+    ) {
+        // get mouse position over image
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let rect = ui.min_rect();
+
+            if rect.contains(pos) {
+                let min_y = rect.min.y;
+                let min_x = rect.min.x - (rect.height() * aspect - rect.width()) / 2.0;
+
+                let uv = (pos - egui::pos2(min_x, min_y)) / rect.height();
+                let img_x = uv.x * self.size.0 as f32;
+                let img_y = uv.y * self.size.1 as f32;
+
+                if img_x > 0.0
+                    && img_y > 0.0
+                    && img_x < self.size.0 as f32
+                    && img_y < self.size.1 as f32
+                    && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                {
+                    self.draw(self.gui.last_mouse_pos, (img_x, img_y), device);
+                    self.gui.last_mouse_pos = Some((img_x, img_y));
+                } else {
+                    self.gui.last_mouse_pos = None;
+                }
+            } else {
+                self.gui.last_mouse_pos = None;
+            }
+        } else {
+            self.gui.last_mouse_pos = None;
+        }
+    }
 }
+
 const DRAWING_ALPHA: f32 = 0.5;
 fn point_to_line_dist(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     let dx = x1 - x0;
@@ -1390,6 +1392,37 @@ fn get_presets() -> Vec<PathBuf> {
         .collect()
     } else {
         Vec::new()
+    }
+}
+
+struct GuiState {
+    last_mouse_pos: Option<(f32, f32)>,
+    drawing_color: [f32; 4],
+    mode: GuiMode,
+    animate: bool,
+    fps_text: String,
+    show_progress_modal: bool,
+    last_progress: f32,
+    process_cancelled: Arc<AtomicBool>,
+    quick_process: bool,
+    currently_processing: Option<PathBuf>,
+    presets: Vec<PathBuf>,
+}
+impl GuiState {
+    fn default(presets: Vec<PathBuf>) -> GuiState {
+        GuiState {
+            animate: true,
+            fps_text: String::new(),
+            presets,
+            mode: GuiMode::Transform,
+            show_progress_modal: false,
+            last_progress: 0.0,
+            process_cancelled: Arc::new(AtomicBool::new(false)),
+            quick_process: false,
+            last_mouse_pos: None,
+            drawing_color: [0.0, 0.0, 0.0, DRAWING_ALPHA],
+            currently_processing: None,
+        }
     }
 }
 
@@ -1446,8 +1479,7 @@ impl App for VoronoiApp {
         } else {
             self.run_gpu(rs);
 
-            // Optionally animate seeds a bit
-            if self.animate {
+            if self.gui.animate {
                 if self.gif_status.is_recording() {
                     for _ in 0..(60 / GIF_FRAMERATE) {
                         self.sim.update(&mut self.seeds, self.size.0);
@@ -1455,7 +1487,7 @@ impl App for VoronoiApp {
 
                     if let Err(e) = self.write_frame_to_gif(device, &rs.queue) {
                         self.gif_status = GifStatus::Error(e.to_string());
-                        self.animate = false;
+                        self.gui.animate = false;
                     } else {
                         self.gif_frame_count += 1;
 
@@ -1465,11 +1497,13 @@ impl App for VoronoiApp {
                             if let GifStatus::Recording(Some(path)) = self.gif_status.clone() {
                                 self.gif_status = GifStatus::Complete(path);
                             } else {
-                                self.gif_status =
-                                    GifStatus::Error("Something weird happened".into());
+                                self.gif_status = GifStatus::Error(format!(
+                                    "Something weird happened: {:?}",
+                                    self.gif_status
+                                ));
                             }
 
-                            self.animate = false;
+                            self.gui.animate = false;
                         }
                     }
                 } else {
@@ -1482,7 +1516,7 @@ impl App for VoronoiApp {
 
         let dt = self.prev_frame_time.elapsed();
         self.prev_frame_time = std::time::Instant::now();
-        self.fps_text = format!(
+        self.gui.fps_text = format!(
             "{:5.2} ms/frame (~{:06.0} FPS)",
             dt.as_secs_f64() * 1000.0,
             1.0 / dt.as_secs_f64()
@@ -1492,291 +1526,318 @@ impl App for VoronoiApp {
         ctx.set_zoom_factor(1.4);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // if ui
-                //     .add_enabled(
-                //         !self.animate,
-                //         egui::Button::new("play transformation"), //.fill(egui::Color32::from_rgb(47, 92, 34)),
-                //     )
-                //     .clicked()
-                // {
-                //     self.animate = true;
-                // }
-                // if ui
-                //     .add_enabled(self.animate, egui::Button::new("switch target"))
-                //     .clicked()
-                // {
-                //     self.sim.switch();
-                // }
-                // if ui.button("reload").clicked() {
-                //     self.change_sim(device, self.sim.source_path(), true);
-                //     self.animate = false;
-                // }
-                // ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                match self.gui.mode {
+                    GuiMode::Draw => {
+                        if ui.button("reset").clicked() {
+                            let path = std::path::PathBuf::from("./blank.png");
 
-                // if ui.button("save gif").clicked() {
-                //     self.gif_status = GifStatus::Recording(None);
-                //     self.resize_textures(device, (GIF_RESOLUTION, GIF_RESOLUTION), false);
-                //     self.change_sim(device, self.sim.source_path(), true);
-                //     self.animate = true;
-                //     for _ in 0..20 {
-                //         self.sim.update(&mut self.seeds, self.size.0);
-                //     }
-                // }
+                            self.gui.show_progress_modal = true;
+                            self.gui.quick_process = false;
 
-                // ui.separator();
-                // // choose preset
-                // // for (i, preset) in self.presets.clone().into_iter().enumerate() {
-                // //     if ui.button(i.to_string()).clicked() {
-                // //         self.change_sim(device, preset);
-                // //         self.animate = false;
-                // //     }
-                // // }
-                // ui.label("choose preset:");
-                // egui::ComboBox::from_label("")
-                //     .selected_text(self.sim.name())
-                //     .show_ui(ui, |ui| {
-                //         for preset in self.presets.clone().into_iter() {
-                //             if ui.button(preset_path_to_name(&preset)).clicked() {
-                //                 // Call change_sim when a new preset is selected
-                //                 self.change_sim(device, preset, true);
-                //                 self.animate = false;
-                //             }
-                //         }
-                //     });
-                // ui.separator();
-                // if ui.button("obamify new image").clicked() {
-                //     // open file select
-                //     let file = rfd::FileDialog::new()
-                //         .set_title("choose image (square aspect ratio recommended)")
-                //         .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
-                //         .pick_file();
-                //     if let Some(path) = file {
-                //         self.show_progress_modal = true;
-                //         self.quick_process = false;
+                            let settings = GenerationSettings::default();
+                            todo!(); //self.change_sim(device, path.clone(), false);
+                            self.gui.animate = true;
 
-                //         let settings = GenerationSettings::default();
-                //         self.currently_processing = Some(path.clone());
-                //         self.change_sim(device, path.clone(), false);
-
-                //         std::thread::spawn({
-                //             let tx = self.progress_tx.clone();
-                //             let cancelled = self.process_cancelled.clone();
-                //             move || {
-                //                 let result = calculate::process_optimal(
-                //                     path,
-                //                     settings,
-                //                     tx.clone(),
-                //                     cancelled,
-                //                 );
-                //                 match result {
-                //                     Ok(()) => {}
-                //                     Err(err) => {
-                //                         tx.send(ProgressMsg::Error(err.to_string())).ok();
-                //                     }
-                //                 }
-                //             }
-                //         });
-                //     }
-                // }
-
-                if ui.button("reset").clicked() {
-                    let path = std::path::PathBuf::from("./blank.png");
-
-                    self.show_progress_modal = true;
-                    self.quick_process = false;
-
-                    let settings = GenerationSettings::default();
-                    self.change_sim(device, path.clone(), false);
-                    self.animate = true;
-
-                    std::thread::spawn({
-                        let tx = self.progress_tx.clone();
-                        let cancelled = self.process_cancelled.clone();
-                        let colors = Arc::clone(&self.colors);
-                        let pixel_data = Arc::clone(&self.pixeldata);
-                        let frame_count = self.frame_count;
-                        move || {
-                            let result = calculate::process_genetic(
-                                path,
-                                settings,
-                                tx.clone(),
-                                cancelled,
-                                colors,
-                                pixel_data,
-                                frame_count,
-                            );
-                            match result {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    tx.send(ProgressMsg::Error(err.to_string())).ok();
+                            std::thread::spawn({
+                                let tx = self.progress_tx.clone();
+                                let cancelled = self.gui.process_cancelled.clone();
+                                let colors = Arc::clone(&self.colors);
+                                let pixel_data = Arc::clone(&self.pixeldata);
+                                let frame_count = self.frame_count;
+                                move || {
+                                    let result =
+                                        calculate::drawing_process::drawing_process_genetic(
+                                            path,
+                                            settings,
+                                            tx.clone(),
+                                            cancelled,
+                                            colors,
+                                            pixel_data,
+                                            frame_count,
+                                        );
+                                    match result {
+                                        Ok(()) => {}
+                                        Err(err) => {
+                                            tx.send(ProgressMsg::Error(err.to_string())).ok();
+                                        }
+                                    }
                                 }
-                            }
+                            });
                         }
-                    });
-                }
 
-                if self.show_progress_modal {
-                    // Modal::new("progress_modal".into()).show(ui.ctx(), |ui| {
-                    //     let processing_label_message = if self.quick_process {
-                    //         "processing..."
-                    //     } else {
-                    //         "processing... (could take a while)"
-                    //     };
-                    //     ui.vertical(|ui| {
-                    //         ui.set_min_width(ui.available_width().min(400.0));
-                    //         if let Ok(msg) = self.progress_rx.try_recv() {
-                    //             match msg {
-                    //                 ProgressMsg::Done(path) => {
-                    //                     self.preview_image = None;
-                    //                     self.presets = get_presets();
-                    //                     self.change_sim(device, path);
-                    //                     self.animate = true;
-                    //                     self.show_progress_modal = false;
-                    //                     ui.close();
-                    //                 }
-                    //                 ProgressMsg::Progress(p) => {
-                    //                     ui.label(processing_label_message);
-                    //                     self.last_progress = p;
-                    //                     ui.add(egui::ProgressBar::new(p).show_percentage());
-                    //                 }
-                    //                 ProgressMsg::Error(err) => {
-                    //                     ui.label(format!("error: {}", err));
-                    //                     if ui.button("close").clicked() {
-                    //                         ui.close();
-                    //                     }
-                    //                 }
-                    //                 ProgressMsg::UpdatePreview(image) => {
-                    //                     self.preview_image = Some(image);
-                    //                 }
-                    //                 ProgressMsg::Cancelled => {
-                    //                     self.process_cancelled
-                    //                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    //                     self.preview_image = None;
-                    //                     if self.quick_process {
-                    //                         let settings = GenerationSettings::quick_process();
-
-                    //                         std::thread::spawn({
-                    //                             let tx = self.progress_tx.clone();
-                    //                             let cancelled = self.process_cancelled.clone();
-                    //                             let path =
-                    //                                 self.currently_processing.clone().unwrap();
-                    //                             move || match calculate::process_optimal(
-                    //                                 path,
-                    //                                 settings,
-                    //                                 tx.clone(),
-                    //                                 cancelled,
-                    //                             ) {
-                    //                                 Ok(()) => {}
-                    //                                 Err(err) => {
-                    //                                     tx.send(ProgressMsg::Error(
-                    //                                         err.to_string(),
-                    //                                     ))
-                    //                                     .ok();
-                    //                                 }
-                    //                             }
-                    //                         });
-                    //                     } else {
-                    //                         self.show_progress_modal = false;
-                    //                         ui.close();
-                    //                     }
-                    //                 }
-                    //                 ProgressMsg::UpdateAssignments(assignments) => {
-                    //                     self.sim.set_assignments(assignments, self.size.0)
-                    //                 }
-                    //             }
-                    //         } else {
-                    //             if self
-                    //                 .process_cancelled
-                    //                 .load(std::sync::atomic::Ordering::Relaxed)
-                    //             {
-                    //                 ui.label("cancelling...");
-                    //             } else {
-                    //                 ui.label(processing_label_message);
-                    //             }
-                    //             ui.add(
-                    //                 egui::ProgressBar::new(self.last_progress).show_percentage(),
-                    //             );
-                    //         }
-                    //         ui.horizontal(|ui| {
-                    //             if ui.button("cancel").clicked() {
-                    //                 self.quick_process = false;
-                    //                 self.process_cancelled
-                    //                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                    //                 self.last_progress = 0.0;
-                    //             }
-
-                    //             if !self.quick_process
-                    //                 && ui
-                    //                     .button("make faster, lower quality result instead")
-                    //                     .clicked()
-                    //             {
-                    //                 self.process_cancelled
-                    //                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                    //                 self.last_progress = 0.0;
-                    //                 self.quick_process = true;
-                    //             }
-                    //         })
-                    //     });
-                    // });
-                    if let Ok(msg) = self.progress_rx.try_recv() {
-                        match msg {
-                            ProgressMsg::UpdatePreview(image) => {
-                                self.preview_image = Some(image);
+                        if let Ok(msg) = self.progress_rx.try_recv() {
+                            match msg {
+                                ProgressMsg::UpdatePreview(image) => {
+                                    self.preview_image = Some(image);
+                                }
+                                ProgressMsg::Cancelled => {
+                                    self.gui
+                                        .process_cancelled
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    self.preview_image = None;
+                                    self.gui.show_progress_modal = false;
+                                    ui.close();
+                                }
+                                ProgressMsg::UpdateAssignments(assignments) => {
+                                    self.sim.set_assignments(assignments, self.size.0)
+                                }
+                                ProgressMsg::Progress(_) => todo!(),
+                                ProgressMsg::Done(path_buf) => todo!(),
+                                ProgressMsg::Error(_) => todo!(),
                             }
-                            ProgressMsg::Cancelled => {
-                                self.process_cancelled
-                                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                                self.preview_image = None;
-                                self.show_progress_modal = false;
-                                ui.close();
-                            }
-                            ProgressMsg::UpdateAssignments(assignments) => {
-                                self.sim.set_assignments(assignments, self.size.0)
-                            }
-                            _ => todo!("lol"),
                         }
                     }
+                    GuiMode::Transform => {
+                        if ui
+                            .add_enabled(
+                                !self.gui.animate,
+                                egui::Button::new("play transformation"), //.fill(egui::Color32::from_rgb(47, 92, 34)),
+                            )
+                            .clicked()
+                        {
+                            self.gui.animate = true;
+                        }
+                        if ui
+                            .add_enabled(self.gui.animate, egui::Button::new("switch target"))
+                            .clicked()
+                        {
+                            self.sim.switch();
+                        }
+                        if ui.button("reload").clicked() {
+                            self.change_sim(device, self.sim.source_path());
+                            self.gui.animate = false;
+                        }
+                        ui.separator();
 
-                    // if modal.should_close() {
-                    //     self.show_progress_modal = false;
-                    // }
+                        if ui.button("save gif").clicked() {
+                            self.gif_status = GifStatus::Recording(None);
+                            self.resize_textures(device, (GIF_RESOLUTION, GIF_RESOLUTION), false);
+                            self.change_sim(device, self.sim.source_path());
+                            self.gui.animate = true;
+                            for _ in 0..20 {
+                                self.sim.update(&mut self.seeds, self.size.0);
+                            }
+                        }
+
+                        ui.separator();
+                        // choose preset
+                        // for (i, preset) in self.gui.presets.clone().into_iter().enumerate() {
+                        //     if ui.button(i.to_string()).clicked() {
+                        //         self.change_sim(device, preset);
+                        //         self.gui.animate = false;
+                        //     }
+                        // }
+                        ui.label("choose preset:");
+                        egui::ComboBox::from_label("")
+                            .selected_text({
+                                let name = self.sim.name();
+                                if name.chars().count() > 13 {
+                                    let truncated: String = name.chars().take(10).collect();
+                                    format!("{truncated}…")
+                                } else {
+                                    name.to_string()
+                                }
+                            })
+                            .show_ui(ui, |ui| {
+                                for preset in self.gui.presets.clone().into_iter() {
+                                    if ui.button(preset_path_to_name(&preset)).clicked() {
+                                        // Call change_sim when a new preset is selected
+                                        self.change_sim(device, preset);
+                                        self.gui.animate = false;
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        if ui.button("obamify new image").clicked() {
+                            // open file select
+                            let file = rfd::FileDialog::new()
+                                .set_title("choose image (square aspect ratio recommended)")
+                                .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
+                                .pick_file();
+                            if let Some(path) = file {
+                                self.gui.show_progress_modal = true;
+                                self.gui.quick_process = false;
+
+                                let settings = GenerationSettings::default();
+                                self.gui.currently_processing = Some(path.clone());
+                                //self.change_sim(device, path.clone(), false);
+
+                                std::thread::spawn({
+                                    let tx = self.progress_tx.clone();
+                                    let cancelled = self.gui.process_cancelled.clone();
+                                    move || {
+                                        let result = calculate::process_optimal(
+                                            path,
+                                            settings,
+                                            tx.clone(),
+                                            cancelled,
+                                        );
+                                        match result {
+                                            Ok(()) => {}
+                                            Err(err) => {
+                                                tx.send(ProgressMsg::Error(err.to_string())).ok();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
+                        if self.gui.show_progress_modal {
+                            Window::new("progress")
+                                .title_bar(false)
+                                .collapsible(false)
+                                .resizable(false)
+                                .movable(false)
+                                .anchor(egui::Align2::CENTER_BOTTOM, (0.0, 0.0))
+                                .show(ui.ctx(), |ui| {
+                                    let processing_label_message = if self.gui.quick_process {
+                                        "processing..."
+                                    } else {
+                                        "processing... (could take a while)"
+                                    };
+                                    ui.vertical(|ui| {
+                                    ui.set_min_width(ui.available_width().min(400.0));
+                                    if let Ok(msg) = self.progress_rx.try_recv() {
+                                        match msg {
+                                            ProgressMsg::Done(path) => {
+                                                self.preview_image = None;
+                                                self.gui.presets = get_presets();
+                                                self.change_sim(device, path);
+                                                self.gui.animate = true;
+                                                self.gui.show_progress_modal = false;
+                                                ui.close();
+                                            }
+                                            ProgressMsg::Progress(p) => {
+                                                self.gui.last_progress = p;
+                                            }
+                                            ProgressMsg::Error(err) => {
+                                                ui.label(format!("error: {}", err));
+                                                if ui.button("close").clicked() {
+                                                    ui.close();
+                                                }
+                                            }
+                                            ProgressMsg::UpdatePreview(image) => {
+                                                self.preview_image = Some(image);
+                                            }
+                                            ProgressMsg::Cancelled => {
+                                                self.gui.process_cancelled.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                self.preview_image = None;
+                                                if self.gui.quick_process {
+                                                    let settings = GenerationSettings::default();
+
+                                                    std::thread::spawn({
+                                                        let tx = self.progress_tx.clone();
+                                                        let cancelled =
+                                                            self.gui.process_cancelled.clone();
+                                                        let path = self.gui
+                                                            .currently_processing
+                                                            .clone()
+                                                            .unwrap();
+                                                        move || match calculate::process_genetic(
+                                                            path,
+                                                            settings,
+                                                            tx.clone(),
+                                                            cancelled,
+                                                        ) {
+                                                            Ok(()) => {}
+                                                            Err(err) => {
+                                                                tx.send(ProgressMsg::Error(
+                                                                    err.to_string(),
+                                                                ))
+                                                                .ok();
+                                                            }
+                                                        }
+                                                    });
+                                                } else {
+                                                    self.gui.show_progress_modal = false;
+                                                    ui.close();
+                                                }
+                                            }
+                                            ProgressMsg::UpdateAssignments(assignments) => {
+                                                self.sim.set_assignments(assignments, self.size.0)
+                                            }
+                                        }
+                                    }
+
+                                    if self.gui
+                                        .process_cancelled
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        ui.label("cancelling...");
+                                    } else {
+                                        ui.label(processing_label_message);
+                                    }
+                                    ui.add(
+                                        egui::ProgressBar::new(self.gui.last_progress)
+                                            .show_percentage(),
+                                    );
+
+                                    ui.horizontal(|ui| {
+                                        if ui.button("cancel").clicked() {
+                                            self.gui.quick_process = false;
+                                            self.gui.process_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            self.gui.last_progress = 0.0;
+                                        }
+
+                                        if !self.gui.quick_process
+                                            && ui
+                                                .button("make faster, lower quality result instead")
+                                                .clicked()
+                                        {
+                                            self.gui.process_cancelled
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                            self.gui.last_progress = 0.0;
+                                            self.gui.quick_process = true;
+                                        }
+                                    })
+                                });
+                                });
+
+                            // if modal.should_close() {
+                            //     self.gui.show_progress_modal = false;
+                            // }
+                        } else if !self.gif_status.not_recording() {
+                            Modal::new("recording_progress".into()).show(ui.ctx(), |ui| match self
+                                .gif_status
+                                .clone()
+                            {
+                                GifStatus::Recording(_) => {
+                                    ui.label("Recording GIF...");
+                                }
+
+                                GifStatus::Error(err) => {
+                                    ui.label(format!("Error: {}", err));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("close").clicked() {
+                                            self.stop_recording_gif(device);
+                                        }
+                                    });
+                                }
+                                GifStatus::Complete(path) => {
+                                    ui.label("gif saved!");
+                                    ui.horizontal(|ui| {
+                                        if ui.button("open file").clicked() {
+                                            opener::reveal(path).ok();
+                                        }
+                                        if ui.button("close").clicked() {
+                                            self.stop_recording_gif(device);
+                                        }
+                                    });
+                                }
+                                GifStatus::None => unreachable!(),
+                            });
+                        }
+
+                        // ui.separator();
+                        // ui.label(&self.gui.fps_text);
+                    }
                 }
-                // else if !self.gif_status.not_recording() {
-                //     Modal::new("recording_progress".into()).show(ui.ctx(), |ui| {
-                //         match self.gif_status.clone() {
-                //             GifStatus::Recording(_) => {
-                //                 ui.label("Recording GIF...");
-                //             }
-
-                //             GifStatus::Error(err) => {
-                //                 ui.label(format!("Error: {}", err));
-                //                 ui.horizontal(|ui| {
-                //                     if ui.button("close").clicked() {
-                //                         self.stop_recording_gif(device);
-                //                     }
-                //                 });
-                //             }
-                //             GifStatus::Complete(path) => {
-                //                 ui.label("gif saved!");
-                //                 ui.horizontal(|ui| {
-                //                     if ui.button("open folder").clicked() {
-                //                         if let Some(parent) = path.parent() {
-                //                             opener::open(parent).ok();
-                //                         }
-                //                     }
-                //                     if ui.button("close").clicked() {
-                //                         self.stop_recording_gif(device);
-                //                     }
-                //                 });
-                //             }
-                //             GifStatus::None => unreachable!(),
-                //         }
-                //     });
-                // }
-
-                ui.separator();
-                ui.label(&self.fps_text);
             });
         });
 
@@ -1790,201 +1851,178 @@ impl App for VoronoiApp {
                         let desired = full.x.min(full.y) * egui::vec2(1.0, aspect);
                         ui.add(egui::Image::new((id, desired)).maintain_aspect_ratio(true));
 
-                        // get mouse position over image
-                        if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                            let rect = ui.min_rect();
-
-                            if rect.contains(pos) {
-                                let min_y = rect.min.y;
-                                let min_x =
-                                    rect.min.x - (rect.height() * aspect - rect.width()) / 2.0;
-
-                                let uv = (pos - egui::pos2(min_x, min_y)) / rect.height();
-                                let img_x = uv.x * self.size.0 as f32;
-                                let img_y = uv.y * self.size.1 as f32;
-
-                                if img_x > 0.0
-                                    && img_y > 0.0
-                                    && img_x < self.size.0 as f32
-                                    && img_y < self.size.1 as f32
-                                    && ctx.input(|i| {
-                                        i.pointer.button_down(egui::PointerButton::Primary)
-                                    })
-                                {
-                                    self.draw(self.last_mouse_pos, (img_x, img_y), device);
-                                    self.last_mouse_pos = Some((img_x, img_y));
-                                } else {
-                                    self.last_mouse_pos = None;
-                                }
-                            } else {
-                                self.last_mouse_pos = None;
-                            }
-                        } else {
-                            self.last_mouse_pos = None;
+                        if matches!(self.gui.mode, GuiMode::Draw) {
+                            self.handle_drawing(ctx, device, ui, aspect);
                         }
                     } else {
                         ui.colored_label(Color32::LIGHT_RED, "Texture not ready");
                     }
                 });
             });
+        if matches!(self.gui.mode, GuiMode::Draw) {
+            let number_keys = [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+            ];
 
-        let number_keys = [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-            egui::Key::Num5,
-        ];
+            // DBECEE,383232, 6B5E57,D49976
 
-        // DBECEE,383232, 6B5E57,D49976
+            let colors = [
+                ("black", 0x000000),
+                ("a", 0x86d9e3),
+                ("b", 0x383232),
+                ("c", 0xD49976),
+                ("d", 0x793025),
+            ];
 
-        let colors = [
-            ("black", 0x000000),
-            ("a", 0x86d9e3),
-            ("b", 0x383232),
-            ("c", 0xD49976),
-            ("d", 0x793025),
-        ];
+            for (idx, (name, color)) in colors.iter().enumerate() {
+                if ctx.input(|i| i.key_pressed(number_keys[idx])) {
+                    let hex = *color;
+                    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+                    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+                    let b = (hex & 0xFF) as f32 / 255.0;
+                    let a = 0.5;
 
-        for (idx, (name, color)) in colors.iter().enumerate() {
-            if ctx.input(|i| i.key_pressed(number_keys[idx])) {
-                let hex = *color;
-                let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
-                let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
-                let b = (hex & 0xFF) as f32 / 255.0;
-                let a = 0.5;
-
-                self.drawing_color = [r, g, b, a];
-            }
-        }
-        // show selected drawing color
-        egui::Area::new("drawing_color".into())
-            .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 30.0))
-            .show(ctx, |ui| {
-                let rect_size = 30.0;
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(rect_size, rect_size), egui::Sense::hover());
-                let color = egui::Color32::from_rgba_unmultiplied(
-                    (self.drawing_color[0] * 255.0) as u8,
-                    (self.drawing_color[1] * 255.0) as u8,
-                    (self.drawing_color[2] * 255.0) as u8,
-                    255,
-                );
-                ui.painter().rect_filled(rect, 15.0, color);
-                if ui.is_rect_visible(rect) {
-                    ui.painter().rect_stroke(
-                        rect,
-                        15.0,
-                        (2.0, egui::Color32::WHITE),
-                        egui::StrokeKind::Inside,
-                    );
+                    self.gui.drawing_color = [r, g, b, a];
                 }
-
-                // Keep the picker visible while hovering either the main swatch or the picker area.
-                let spacing = 10.0;
-                let btn_size = rect_size / 2.0;
-                let gap = 4.0;
-
-                // Layout picker row next to the swatch, vertically centered.
-                let n_buttons = colors.len() as f32;
-                let picker_width = n_buttons * btn_size + (n_buttons - 1.0).max(0.0) * gap;
-                let picker_min =
-                    rect.min + egui::vec2(rect_size + spacing, (rect_size - btn_size) * 0.5);
-                let picker_rect = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(picker_width + rect_size + spacing, rect_size),
-                );
-
-                // Decide visibility purely from pointer position to avoid z-order flicker.
-                let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-                let show_picker = ui.is_rect_visible(rect)
-                    && pointer_pos.map_or(false, |p| rect.contains(p) || picker_rect.contains(p));
-
-                // Global visibility animation driver
-                let base_t = ui
-                    .ctx()
-                    .animate_bool(egui::Id::new("color_picker_visible"), show_picker);
-
-                // Helpers
-                let saturate = |x: f32| x.max(0.0).min(1.0);
-                let smoothstep = |x: f32| {
-                    let x = saturate(x);
-                    x * x * (3.0 - 2.0 * x)
-                };
-
-                // Start position = centered under the main swatch so buttons "emerge" from it
-                let start_pos = egui::pos2(
-                    rect.min.x + (rect_size - btn_size) * 0.5,
-                    rect.min.y + (rect_size - btn_size) * 0.5,
-                );
-
-                // Per-button stagger
-                let per_btn_delay = 0.08_f32;
-                // Ensure the last button still reaches t=1 when base_t=1
-                let total_stagger = (n_buttons - 1.0).max(0.0) * per_btn_delay;
-                let denom = (1.0 - total_stagger).max(1e-6);
-
-                for (idx, (_name, hex)) in colors.iter().enumerate() {
-                    let rgba = {
-                        let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
-                        let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
-                        let b = (hex & 0xFF) as f32 / 255.0;
-                        let a = DRAWING_ALPHA;
-                        [r, g, b, a]
-                    };
-                    let i = idx as f32;
-
-                    // Staggered progress for each button; normalized so the last also reaches 1.0
-                    let raw = (base_t - per_btn_delay * i) / denom;
-                    let t_i = smoothstep(raw);
-
-                    // Only draw while animating or visible to avoid early reveal
-                    if t_i <= 0.001 {
-                        continue;
+            }
+            // show selected drawing color
+            egui::Area::new("drawing_color".into())
+                .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 30.0))
+                .show(ctx, |ui| {
+                    let rect_size = 30.0;
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(rect_size, rect_size),
+                        egui::Sense::hover(),
+                    );
+                    let color = egui::Color32::from_rgba_unmultiplied(
+                        (self.gui.drawing_color[0] * 255.0) as u8,
+                        (self.gui.drawing_color[1] * 255.0) as u8,
+                        (self.gui.drawing_color[2] * 255.0) as u8,
+                        255,
+                    );
+                    ui.painter().rect_filled(rect, 15.0, color);
+                    if ui.is_rect_visible(rect) {
+                        ui.painter().rect_stroke(
+                            rect,
+                            15.0,
+                            (2.0, egui::Color32::WHITE),
+                            egui::StrokeKind::Inside,
+                        );
                     }
 
-                    // Target position to the right of the swatch
-                    let end_pos = egui::pos2(picker_min.x + i * (btn_size + gap), picker_min.y);
+                    // Keep the picker visible while hovering either the main swatch or the picker area.
+                    let spacing = 10.0;
+                    let btn_size = rect_size / 2.0;
+                    let gap = 4.0;
 
-                    // Interpolate from under the swatch to the target
-                    let pos = egui::pos2(
-                        egui::lerp(start_pos.x..=end_pos.x, t_i),
-                        egui::lerp(start_pos.y..=end_pos.y, t_i),
+                    // Layout picker row next to the swatch, vertically centered.
+                    let n_buttons = colors.len() as f32;
+                    let picker_width = n_buttons * btn_size + (n_buttons - 1.0).max(0.0) * gap;
+                    let picker_min =
+                        rect.min + egui::vec2(rect_size + spacing, (rect_size - btn_size) * 0.5);
+                    let picker_rect = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(picker_width + rect_size + spacing, rect_size),
                     );
 
-                    egui::Area::new(egui::Id::new(format!("color_picker_btn_{idx}")))
-                        .fixed_pos(pos)
-                        .show(ctx, |ui| {
-                            let (btn_rect, btn_resp) = ui.allocate_exact_size(
-                                egui::vec2(btn_size, btn_size),
-                                egui::Sense::click(),
-                            );
+                    // Decide visibility purely from pointer position to avoid z-order flicker.
+                    let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+                    let show_picker = ui.is_rect_visible(rect)
+                        && pointer_pos.is_some_and(|p| rect.contains(p) || picker_rect.contains(p));
 
-                            // Fade with the slide
-                            let a = (255.0 * t_i) as u8;
-                            let color32 = egui::Color32::from_rgba_unmultiplied(
-                                (rgba[0] * 255.0) as u8,
-                                (rgba[1] * 255.0) as u8,
-                                (rgba[2] * 255.0) as u8,
-                                a,
-                            );
+                    // Global visibility animation driver
+                    let base_t = ui
+                        .ctx()
+                        .animate_bool(egui::Id::new("color_picker_visible"), show_picker);
 
-                            ui.painter().rect_filled(btn_rect, 15.0 / 2.0, color32);
-                            if ui.is_rect_visible(btn_rect) {
-                                ui.painter().rect_stroke(
-                                    btn_rect,
-                                    15.0 / 2.0,
-                                    (2.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, a)),
-                                    egui::StrokeKind::Inside,
+                    // Helpers
+                    let saturate = |x: f32| x.clamp(0.0, 1.0);
+                    let smoothstep = |x: f32| {
+                        let x = saturate(x);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+
+                    // Start position = centered under the main swatch so buttons "emerge" from it
+                    let start_pos = egui::pos2(
+                        rect.min.x + (rect_size - btn_size) * 0.5,
+                        rect.min.y + (rect_size - btn_size) * 0.5,
+                    );
+
+                    // Per-button stagger
+                    let per_btn_delay = 0.08_f32;
+                    // Ensure the last button still reaches t=1 when base_t=1
+                    let total_stagger = (n_buttons - 1.0).max(0.0) * per_btn_delay;
+                    let denom = (1.0 - total_stagger).max(1e-6);
+
+                    for (idx, (_name, hex)) in colors.iter().enumerate() {
+                        let rgba = {
+                            let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+                            let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+                            let b = (hex & 0xFF) as f32 / 255.0;
+                            let a = DRAWING_ALPHA;
+                            [r, g, b, a]
+                        };
+                        let i = idx as f32;
+
+                        // Staggered progress for each button; normalized so the last also reaches 1.0
+                        let raw = (base_t - per_btn_delay * i) / denom;
+                        let t_i = smoothstep(raw);
+
+                        // Only draw while animating or visible to avoid early reveal
+                        if t_i <= 0.001 {
+                            continue;
+                        }
+
+                        // Target position to the right of the swatch
+                        let end_pos = egui::pos2(picker_min.x + i * (btn_size + gap), picker_min.y);
+
+                        // Interpolate from under the swatch to the target
+                        let pos = egui::pos2(
+                            egui::lerp(start_pos.x..=end_pos.x, t_i),
+                            egui::lerp(start_pos.y..=end_pos.y, t_i),
+                        );
+
+                        egui::Area::new(egui::Id::new(format!("color_picker_btn_{idx}")))
+                            .fixed_pos(pos)
+                            .show(ctx, |ui| {
+                                let (btn_rect, btn_resp) = ui.allocate_exact_size(
+                                    egui::vec2(btn_size, btn_size),
+                                    egui::Sense::click(),
                                 );
-                            }
 
-                            if btn_resp.clicked() {
-                                self.drawing_color = rgba;
-                            }
-                        });
-                }
-            });
+                                // Fade with the slide
+                                let a = (255.0 * t_i) as u8;
+                                let color32 = egui::Color32::from_rgba_unmultiplied(
+                                    (rgba[0] * 255.0) as u8,
+                                    (rgba[1] * 255.0) as u8,
+                                    (rgba[2] * 255.0) as u8,
+                                    a,
+                                );
+
+                                ui.painter().rect_filled(btn_rect, 15.0 / 2.0, color32);
+                                if ui.is_rect_visible(btn_rect) {
+                                    ui.painter().rect_stroke(
+                                        btn_rect,
+                                        15.0 / 2.0,
+                                        (
+                                            2.0,
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, a),
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+
+                                if btn_resp.clicked() {
+                                    self.gui.drawing_color = rgba;
+                                }
+                            });
+                    }
+                });
+        }
 
         // continuous repaint for animation
         ctx.request_repaint();
