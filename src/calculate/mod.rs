@@ -13,15 +13,24 @@ use pathfinding::prelude::Weights;
 use rand::Rng;
 use std::sync::mpsc;
 
+#[derive(Clone, Copy)]
+pub enum Algorithm {
+    Optimal,
+    Genetic,
+}
+
+#[derive(Clone, Copy)]
 pub struct GenerationSettings {
-    proximity_importance: i64,
-    rescale: Option<u32>,
+    pub proximity_importance: i64,
+    pub algorithm: Algorithm,
+    pub rescale: Option<u32>,
 }
 
 impl GenerationSettings {
     pub fn default() -> Self {
         Self {
             proximity_importance: 10, // 20
+            algorithm: Algorithm::Genetic,
             rescale: None,
         }
     }
@@ -436,4 +445,16 @@ fn serialize_assignments(assignments: Vec<usize>) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+pub fn process(
+    source_path: PathBuf,
+    settings: GenerationSettings,
+    tx: mpsc::SyncSender<ProgressMsg>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    match settings.algorithm {
+        Algorithm::Optimal => process_optimal(source_path, settings, tx, cancelled),
+        Algorithm::Genetic => process_genetic(source_path, settings, tx, cancelled),
+    }
 }

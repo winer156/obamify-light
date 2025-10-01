@@ -1,4 +1,8 @@
-use std::{fs, mem, path::PathBuf, time::Instant};
+use std::{
+    fs, mem,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use crate::{SeedColor, SeedPos};
 use image::GenericImageView;
@@ -343,7 +347,7 @@ impl Sim {
     }
 }
 
-pub fn preset_path_to_name(source_dir: &PathBuf) -> String {
+pub fn preset_path_to_name(source_dir: &Path) -> String {
     source_dir
         .file_stem()
         .unwrap()

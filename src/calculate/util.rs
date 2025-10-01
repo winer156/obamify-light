@@ -1,3 +1,5 @@
+use crate::morph_sim::preset_path_to_name;
+
 use super::load_weights;
 
 use super::TARGET_WEIGHTS_PATH;
@@ -52,13 +54,7 @@ pub(crate) fn get_images<P: AsRef<Path>>(
 > {
     let (target, target_pixels, weights) = load_target(settings)?;
 
-    let base_name = source_path
-        .as_ref()
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
+    let base_name = preset_path_to_name(source_path.as_ref());
     let source = image::open(source_path)?.to_rgb8();
     let source = image::imageops::resize(
         &source,
