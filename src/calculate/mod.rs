@@ -4,30 +4,59 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
+pub mod drawing_process;
+pub mod util;
+
 use egui::ahash::AHasher;
 use image::GenericImageView;
 use pathfinding::prelude::Weights;
+use rand::Rng;
 use std::sync::mpsc;
 
+#[derive(Clone, Copy)]
+pub enum Algorithm {
+    Optimal,
+    Genetic,
+}
+
+#[derive(Clone, Copy)]
 pub struct GenerationSettings {
-    proximity_importance: i64,
-    rescale: Option<u32>,
+    pub proximity_importance: i64,
+    pub algorithm: Algorithm,
+    pub rescale: Option<u32>,
 }
 
 impl GenerationSettings {
     pub fn default() -> Self {
         Self {
-            proximity_importance: 13,
+            proximity_importance: 10, // 20
+            algorithm: Algorithm::Genetic,
             rescale: None,
         }
     }
 
-    pub fn quick_process() -> Self {
-        Self {
-            proximity_importance: 10,
-            rescale: Some(64),
-        }
-    }
+    // pub fn quick_process() -> Self {
+    //     Self {
+    //         proximity_importance: 10,
+    //         rescale: Some(64),
+    //     }
+    // }
+}
+
+#[inline(always)]
+fn heuristic(
+    apos: (u16, u16),
+    bpos: (u16, u16),
+    a: (u8, u8, u8),
+    b: (u8, u8, u8),
+    color_weight: i64,
+    spatial_weight: i64,
+) -> i64 {
+    let spatial = (apos.0 as i64 - bpos.0 as i64).pow(2) + (apos.1 as i64 - bpos.1 as i64).pow(2);
+    let color = (a.0 as i64 - b.0 as i64).pow(2)
+        + (a.1 as i64 - b.1 as i64).pow(2)
+        + (a.2 as i64 - b.2 as i64).pow(2);
+    color * color_weight + (spatial * spatial_weight).pow(2)
 }
 
 struct ImgDiffWeights {
@@ -50,20 +79,21 @@ impl Weights<i64> for ImgDiffWeights {
         self.source.len()
     }
 
+    #[inline(always)]
     fn at(&self, row: usize, col: usize) -> i64 {
         let (x1, y1) = (row % self.sidelen, row / self.sidelen);
         let (x2, y2) = (col % self.sidelen, col / self.sidelen);
-        let dist = (x1 as i64 - x2 as i64).pow(2) + (y1 as i64 - y2 as i64).pow(2);
-
         let (r1, g1, b1) = self.target[row];
         let (r2, g2, b2) = self.source[col];
-
-        let dr = r1 as i64 - r2 as i64;
-        let dg = g1 as i64 - g2 as i64;
-        let db = b1 as i64 - b2 as i64;
-
-        -((dr.pow(2) + dg.pow(2) + db.pow(2)) * self.weights[row]
-            + (dist * self.settings.proximity_importance).pow(2))
+        let weight = self.weights[row];
+        -heuristic(
+            (x1 as u16, y1 as u16),
+            (x2 as u16, y2 as u16),
+            (r1, g1, b1),
+            (r2, g2, b2),
+            weight,
+            self.settings.proximity_importance,
+        )
     }
 
     fn neg(&self) -> Self {
@@ -73,6 +103,8 @@ impl Weights<i64> for ImgDiffWeights {
 
 pub enum ProgressMsg {
     Progress(f32),
+    UpdatePreview(image::ImageBuffer<image::Rgb<u8>, Vec<u8>>),
+    UpdateAssignments(Vec<usize>),
     Done(PathBuf), // result directory
     Error(String),
     Cancelled,
@@ -80,62 +112,20 @@ pub enum ProgressMsg {
 
 type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<AHasher>>;
 
-pub fn process<P: AsRef<Path>>(
+pub fn process_optimal<P: AsRef<Path>>(
     source_path: P,
     settings: GenerationSettings,
     tx: mpsc::SyncSender<ProgressMsg>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     let start_time = std::time::Instant::now();
-    let mut target = image::open(TARGET_IMAGE_PATH)?.to_rgb8();
-    let mut target_weights = image::open(TARGET_WEIGHTS_PATH)?.to_rgb8();
-    if target.dimensions().0 != target.dimensions().1 {
-        return Err("Target image must be square".into());
-    }
-    if target.dimensions() != target_weights.dimensions() {
-        return Err("Target and weights images must have the same dimensions".into());
-    }
-
-    if let Some(rescale) = settings.rescale {
-        target = image::imageops::resize(
-            &target,
-            rescale,
-            rescale,
-            image::imageops::FilterType::Lanczos3,
-        );
-        target_weights = image::imageops::resize(
-            &target_weights,
-            rescale,
-            rescale,
-            image::imageops::FilterType::Lanczos3,
-        );
-    }
-    let base_name = source_path
-        .as_ref()
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    let source = image::open(source_path)?.to_rgb8();
-    // rescale source to match target dimensions
-    let source = image::imageops::resize(
-        &source,
-        target.width(),
-        target.height(),
-        image::imageops::FilterType::Lanczos3,
-    );
-
-    let source_pixels = source
-        .pixels()
-        .map(|p| (p[0], p[1], p[2]))
-        .collect::<Vec<_>>();
+    let (target, base_name, source, source_pixels, target_pixels, weights) =
+        util::get_images(source_path, &settings)?;
 
     let weights = ImgDiffWeights {
         source: source_pixels.clone(),
-        target: target.pixels().map(|p| (p[0], p[1], p[2])).collect(),
-        weights: load_weights(&target_weights.into()),
+        target: target_pixels,
+        weights,
         sidelen: target.width() as usize,
         settings,
     };
@@ -200,13 +190,13 @@ pub fn process<P: AsRef<Path>>(
                     // by this minimal slack as well.
                     if delta > 0 {
                         for &x in &s {
-                            lx[x] = lx[x] - delta;
+                            lx[x] -= delta;
                         }
                         for y in 0..ny {
                             if alternating[y].is_some() {
-                                ly[y] = ly[y] + delta;
+                                ly[y] += delta;
                             } else {
-                                slack[y] = slack[y] - delta;
+                                slack[y] -= delta;
                             }
                         }
                     }
@@ -242,11 +232,25 @@ pub fn process<P: AsRef<Path>>(
                 xy[x] = y;
                 y = prec;
             }
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                tx.send(ProgressMsg::Cancelled).unwrap();
-                return Ok(());
+            if root.is_multiple_of(100) {
+                // send progress
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    tx.send(ProgressMsg::Cancelled).unwrap();
+                    return Ok(());
+                }
+                tx.send(ProgressMsg::Progress(root as f32 / nx as f32))?;
+
+                let img = make_new_img(
+                    &source_pixels,
+                    &xy.clone()
+                        .into_iter()
+                        .map(|a| a.unwrap_or(0))
+                        .collect::<Vec<_>>(),
+                    target.width(),
+                );
+
+                tx.send(ProgressMsg::UpdatePreview(img))?;
             }
-            tx.send(ProgressMsg::Progress(root as f32 / nx as f32))?;
         }
         (
             lx.into_iter().sum::<i64>() + ly.into_iter().sum::<i64>(),
@@ -254,33 +258,9 @@ pub fn process<P: AsRef<Path>>(
         )
     };
 
-    let mut img = image::ImageBuffer::new(target.width(), target.height());
+    let img = make_new_img(&source_pixels, &assignments, target.width());
 
-    for (target_idx, source_idx) in assignments.iter().enumerate() {
-        let (x, y) = (
-            (target_idx % target.width() as usize) as u32,
-            (target_idx / target.width() as usize) as u32,
-        );
-        let (r, g, b) = source_pixels[*source_idx];
-        img.put_pixel(x, y, image::Rgb([r, g, b]));
-    }
-
-    let mut dir_name = base_name.clone();
-    let mut counter = 1;
-
-    while std::path::Path::new(&format!("./presets/{}", dir_name)).exists() {
-        dir_name = format!("{}_{}", base_name, counter);
-        counter += 1;
-    }
-
-    std::fs::create_dir_all(format!("./presets/{}", dir_name))?;
-    img.save(format!("./presets/{}/output.png", dir_name))?;
-    source.save(format!("./presets/{}/source.png", dir_name))?;
-    target.save(format!("./presets/{}/target.png", dir_name))?;
-    std::fs::write(
-        format!("./presets/{}/assignments.json", dir_name),
-        serialize_assignments(assignments),
-    )?;
+    let dir_name = util::save_result(target, base_name, source, assignments, img)?;
 
     tx.send(ProgressMsg::Done(PathBuf::from(format!(
         "./presets/{}",
@@ -293,6 +273,157 @@ pub fn process<P: AsRef<Path>>(
     );
 
     Ok(())
+}
+
+fn make_new_img(
+    source_pixels: &[(u8, u8, u8)],
+    assignments: &[usize],
+    sidelen: u32,
+) -> image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    let mut img = image::ImageBuffer::new(sidelen, sidelen);
+
+    for (target_idx, source_idx) in assignments.iter().enumerate() {
+        let (x, y) = (
+            (target_idx % sidelen as usize) as u32,
+            (target_idx / sidelen as usize) as u32,
+        );
+        let (r, g, b) = source_pixels[*source_idx];
+        img.put_pixel(x, y, image::Rgb([r, g, b]));
+    }
+    img
+}
+
+#[derive(Clone, Copy)]
+struct Pixel {
+    src_x: u16,
+    src_y: u16,
+    rgb: (u8, u8, u8),
+    h: i64, // current heuristic value
+}
+
+impl Pixel {
+    fn new(src_x: u16, src_y: u16, rgb: (u8, u8, u8), h: i64) -> Self {
+        Self {
+            src_x,
+            src_y,
+            rgb,
+            h,
+        }
+    }
+
+    fn update_heuristic(&mut self, new_h: i64) {
+        self.h = new_h;
+    }
+
+    #[inline(always)]
+    fn calc_heuristic(
+        &self,
+        target_pos: (u16, u16),
+        target_col: (u8, u8, u8),
+        weight: i64,
+        proximity_importance: i64,
+    ) -> i64 {
+        heuristic(
+            (self.src_x, self.src_y),
+            target_pos,
+            self.rgb,
+            target_col,
+            weight,
+            proximity_importance,
+        )
+    }
+}
+
+const SWAPS_PER_GENERATION: usize = 200000;
+
+pub fn process_genetic<P: AsRef<Path>>(
+    source_path: P,
+    settings: GenerationSettings,
+    tx: mpsc::SyncSender<ProgressMsg>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    let (target, base_name, source, source_pixels, target_pixels, weights) =
+        util::get_images(source_path, &settings)?;
+
+    let mut pixels = source_pixels
+        .iter()
+        .enumerate()
+        .map(|(i, &(r, g, b))| {
+            let x = (i as u32 % source.width()) as u16;
+            let y = (i as u32 / source.width()) as u16;
+            let mut p = Pixel::new(x, y, (r, g, b), 0);
+            let h = p.calc_heuristic(
+                (x, y),
+                target_pixels[i],
+                weights[i],
+                settings.proximity_importance,
+            );
+            p.update_heuristic(h);
+            p
+        })
+        .collect::<Vec<_>>();
+
+    let mut rng = rand::thread_rng();
+    let mut max_dist = target.width();
+    loop {
+        let mut swaps_made = 0;
+        for _ in 0..SWAPS_PER_GENERATION {
+            let apos = rng.gen_range(0..pixels.len());
+            let ax = apos as u16 % target.width() as u16;
+            let ay = apos as u16 / target.width() as u16;
+            let bx = (ax as i16 + rng.gen_range(-(max_dist as i16)..=(max_dist as i16)))
+                .clamp(0, target.width() as i16 - 1) as u16;
+            let by = (ay as i16 + rng.gen_range(-(max_dist as i16)..=(max_dist as i16)))
+                .clamp(0, target.width() as i16 - 1) as u16;
+            let bpos = by as usize * target.width() as usize + bx as usize;
+
+            let t_a = target_pixels[apos];
+            let t_b = target_pixels[bpos];
+
+            let a_on_b_h = pixels[apos].calc_heuristic(
+                (bx, by),
+                t_b,
+                weights[bpos],
+                settings.proximity_importance,
+            );
+
+            let b_on_a_h = pixels[bpos].calc_heuristic(
+                (ax, ay),
+                t_a,
+                weights[apos],
+                settings.proximity_importance,
+            );
+
+            let improvement_a = pixels[apos].h - b_on_a_h;
+            let improvement_b = pixels[bpos].h - a_on_b_h;
+            if improvement_a + improvement_b > 0 {
+                // swap
+                pixels.swap(apos, bpos);
+                pixels[apos].update_heuristic(b_on_a_h);
+                pixels[bpos].update_heuristic(a_on_b_h);
+                swaps_made += 1;
+            }
+        }
+        let assignments = pixels
+            .iter()
+            .map(|p| p.src_y as usize * source.width() as usize + p.src_x as usize)
+            .collect::<Vec<_>>();
+        let img = make_new_img(&source_pixels, &assignments, target.width());
+        if swaps_made < 10 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            let dir_name = util::save_result(target, base_name, source, assignments, img)?;
+            tx.send(ProgressMsg::Done(PathBuf::from(format!(
+                "./presets/{}",
+                dir_name
+            ))))?;
+            return Ok(());
+        }
+        tx.send(ProgressMsg::UpdatePreview(img))?;
+        tx.send(ProgressMsg::Progress(
+            1.0 - max_dist as f32 / target.width() as f32,
+        ))?;
+
+        max_dist = (max_dist as f32 * 0.99).max(2.0) as u32;
+    }
 }
 
 fn load_weights(source: &image::DynamicImage) -> Vec<i64> {
@@ -314,4 +445,16 @@ fn serialize_assignments(assignments: Vec<usize>) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+pub fn process(
+    source_path: PathBuf,
+    settings: GenerationSettings,
+    tx: mpsc::SyncSender<ProgressMsg>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn Error>> {
+    match settings.algorithm {
+        Algorithm::Optimal => process_optimal(source_path, settings, tx, cancelled),
+        Algorithm::Genetic => process_genetic(source_path, settings, tx, cancelled),
+    }
 }

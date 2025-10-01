@@ -1,23 +1,24 @@
-#![windows_subsystem = "windows"]
-
+//#![windows_subsystem = "windows"]
+mod gui;
 mod morph_sim;
 use std::{
     fs::File,
     num::NonZeroU64,
     path::PathBuf,
-    sync::{atomic::AtomicBool, mpsc, Arc},
+    sync::{atomic::AtomicU32, mpsc, Arc, RwLock},
 };
 
 use bytemuck::{Pod, Zeroable};
 use color_quant::NeuQuant;
-use eframe::{egui, App, CreationContext, Frame, NativeOptions};
-use egui::{Color32, Modal, ViewportBuilder};
+use eframe::{egui, CreationContext, NativeOptions};
+use egui::{frame, ViewportBuilder};
 use egui_wgpu::{self, wgpu};
+use image::buffer::ConvertBuffer;
 use wgpu::util::DeviceExt;
 
 use crate::{
-    calculate::{GenerationSettings, ProgressMsg},
-    morph_sim::{preset_path_to_name, Sim},
+    calculate::{drawing_process::PixelData, GenerationSettings, ProgressMsg},
+    morph_sim::Sim,
 };
 
 const WG_SIZE_XY: u32 = 8;
@@ -63,7 +64,7 @@ const GIF_NUM_FRAMES: u32 = 140;
 const GIF_SPEED: f32 = 1.5;
 const GIF_PALETTE_SAMPLEFAC: i32 = 1;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum GifStatus {
     None,
     Recording(Option<PathBuf>),
@@ -72,18 +73,17 @@ enum GifStatus {
 }
 impl GifStatus {
     fn is_recording(&self) -> bool {
-        match self {
-            GifStatus::Recording(_) => true,
-            _ => false,
-        }
+        matches!(self, GifStatus::Recording(_))
     }
 
     fn not_recording(&self) -> bool {
-        match self {
-            GifStatus::None => true,
-            _ => false,
-        }
+        matches!(self, GifStatus::None)
     }
+}
+
+pub enum GuiMode {
+    Transform,
+    Draw,
 }
 
 pub struct VoronoiApp {
@@ -91,17 +91,9 @@ pub struct VoronoiApp {
     // UI state
     size: (u32, u32),
     seed_count: u32,
-    animate: bool,
-    fps_text: String,
-    show_progress_modal: bool,
+
     progress_tx: mpsc::SyncSender<ProgressMsg>,
     progress_rx: mpsc::Receiver<ProgressMsg>,
-    last_progress: f32,
-    process_cancelled: Arc<AtomicBool>,
-    quick_process: bool,
-    currently_processing: Option<PathBuf>,
-
-    presets: Vec<PathBuf>,
 
     gif_status: GifStatus,
     gif_encoder: Option<gif::Encoder<File>>,
@@ -111,7 +103,8 @@ pub struct VoronoiApp {
 
     // Seeds CPU copy
     seeds: Vec<SeedPos>,
-    colors: Vec<SeedColor>,
+    colors: Arc<RwLock<Vec<SeedColor>>>,
+    pixeldata: Arc<RwLock<Vec<PixelData>>>,
 
     // EGUI texture id for presenting the shaded RGBA texture
     egui_tex_id: Option<egui::TextureId>,
@@ -152,14 +145,27 @@ pub struct VoronoiApp {
     jfa_bg_a_to_b: wgpu::BindGroup,
     jfa_bg_b_to_a: wgpu::BindGroup,
     shade_bg: wgpu::BindGroup,
+    preview_image: Option<image::ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
+
+    stroke_count: u32,
+
+    frame_count: u32,
+
+    gui: gui::GuiState,
+    current_drawing_id: Arc<AtomicU32>,
 }
 
 impl VoronoiApp {
-    pub fn change_sim(&mut self, device: &wgpu::Device, source_dir: PathBuf) {
-        let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source_dir);
+    fn apply_sim_init(
+        &mut self,
+        device: &wgpu::Device,
+        seed_count: u32,
+        seeds: Vec<SeedPos>,
+        colors: Vec<SeedColor>,
+        sim: Sim,
+    ) {
         self.seed_count = seed_count;
         self.seeds = seeds;
-
         self.sim = sim;
 
         // Update GPU buffers
@@ -187,9 +193,20 @@ impl VoronoiApp {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        self.colors = colors;
+        *self.colors.write().unwrap() = colors;
+        *self.pixeldata.write().unwrap() = PixelData::init_canvas(self.frame_count);
 
         self.rebuild_bind_groups(device);
+    }
+
+    pub fn change_sim(&mut self, device: &wgpu::Device, source: PathBuf) {
+        let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source);
+        self.apply_sim_init(device, seed_count, seeds, colors, sim);
+    }
+
+    pub fn canvas_sim(&mut self, device: &wgpu::Device, source: PathBuf) {
+        let (seed_count, seeds, colors, sim) = morph_sim::init_canvas(self.size.0, source);
+        self.apply_sim_init(device, seed_count, seeds, colors, sim);
     }
 
     pub fn new(cc: &CreationContext<'_>) -> Self {
@@ -627,10 +644,10 @@ impl VoronoiApp {
         Self {
             size,
             seed_count,
-            animate: true,
-            fps_text: String::new(),
+
             seeds,
-            colors,
+            colors: Arc::new(RwLock::new(colors)),
+            pixeldata: Arc::new(RwLock::new(PixelData::init_canvas(0))),
             egui_tex_id: None,
             seed_buf,
             color_buf,
@@ -658,20 +675,21 @@ impl VoronoiApp {
             jfa_bg_b_to_a,
             shade_bg,
             prev_frame_time: std::time::Instant::now(),
-            presets,
 
             progress_tx,
             progress_rx,
-            show_progress_modal: false,
-            last_progress: 0.0,
-            process_cancelled: Arc::new(AtomicBool::new(false)),
-            quick_process: false,
-            currently_processing: None,
 
             gif_encoder: None,
             gif_status: GifStatus::None,
             gif_frame_count: 0,
             gif_palette: None,
+
+            preview_image: None,
+
+            stroke_count: 0,
+            gui: gui::GuiState::default(presets),
+            frame_count: 0,
+            current_drawing_id: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -726,7 +744,8 @@ impl VoronoiApp {
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1081,7 +1100,7 @@ impl VoronoiApp {
         let bpp = 4u32; // RGBA8
         let unpadded_bytes_per_row = width * bpp;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256
-        let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
         let buffer_size = padded_bytes_per_row as u64 * height as u64;
 
         // Staging buffer to receive the texture
@@ -1180,6 +1199,8 @@ impl VoronoiApp {
             if let Some(path) = file {
                 let colors = self
                     .colors
+                    .read()
+                    .unwrap()
                     .iter()
                     .flat_map(|s| s.rgba.map(|f| (f * 256.0) as u8))
                     .collect::<Vec<u8>>();
@@ -1241,9 +1262,175 @@ impl VoronoiApp {
     fn stop_recording_gif(&mut self, device: &wgpu::Device) {
         self.gif_status = GifStatus::None;
         self.gif_encoder = None;
-        self.animate = false;
+        self.gui.animate = false;
         self.resize_textures(device, (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION), false);
         self.change_sim(device, self.sim.source_path());
+    }
+
+    fn draw(
+        &mut self,
+        last_mouse_pos: Option<(f32, f32)>,
+        mousepos: (f32, f32),
+        device: &wgpu::Device,
+    ) {
+        let stroke_id = if last_mouse_pos.is_some() {
+            self.stroke_count
+        } else {
+            self.stroke_count += 1;
+            self.stroke_count
+        };
+        for (i, seedpos) in self.seeds.iter().enumerate() {
+            let sx = seedpos.xy[0];
+            let sy = seedpos.xy[1];
+
+            let last_mouse_pos = if let Some(a) = last_mouse_pos {
+                a
+            } else {
+                mousepos
+            };
+
+            let dist = point_to_line_dist(
+                sx,
+                sy,
+                last_mouse_pos.0,
+                last_mouse_pos.1,
+                mousepos.0,
+                mousepos.1,
+            );
+            let thickness = if self.gui.drawing_color == [0.0, 0.0, 0.0, DRAWING_ALPHA] {
+                30.0
+            } else {
+                50.0
+            };
+            let transition = 10.0;
+            if dist < thickness + transition {
+                let color = self.gui.drawing_color;
+                let alpha =
+                    ((thickness + transition - dist) / transition).clamp(0.0, 1.0) * color[3];
+                let blend = |c1: f32, c2: f32, a: f32| (1.0 - a) * c1 + a * c2;
+                let mut colors = self.colors.write().unwrap();
+                (*colors)[i].rgba[0] = blend((*colors)[i].rgba[0], color[0], alpha);
+                (*colors)[i].rgba[1] = blend((*colors)[i].rgba[1], color[1], alpha);
+                (*colors)[i].rgba[2] = blend((*colors)[i].rgba[2], color[2], alpha);
+
+                self.sim.cells[i].set_age(0);
+                self.sim.cells[i].set_dst_force(0.05 + (stroke_id as f32 * 0.004).sqrt());
+                self.sim.cells[i].set_stroke_id(stroke_id);
+                self.pixeldata.write().unwrap()[i] = PixelData {
+                    stroke_id,
+                    last_edited: self.frame_count,
+                };
+
+                //self.colors[i].rgba = [0.0, 0.0, 0.0, 1.0];
+            }
+        }
+
+        self.color_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("colors"),
+            contents: bytemuck::cast_slice(&self.colors.read().unwrap()),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+    }
+
+    fn handle_drawing(
+        &mut self,
+        ctx: &egui::Context,
+        device: &wgpu::Device,
+        ui: &mut egui::Ui,
+        aspect: f32,
+    ) {
+        // get mouse position over image
+        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+            let rect = ui.min_rect();
+
+            if rect.contains(pos) {
+                let min_y = rect.min.y;
+                let min_x = rect.min.x - (rect.height() * aspect - rect.width()) / 2.0;
+
+                let uv = (pos - egui::pos2(min_x, min_y)) / rect.height();
+                let img_x = uv.x * self.size.0 as f32;
+                let img_y = uv.y * self.size.1 as f32;
+
+                if img_x > 0.0
+                    && img_y > 0.0
+                    && img_x < self.size.0 as f32
+                    && img_y < self.size.1 as f32
+                    && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
+                {
+                    self.draw(self.gui.last_mouse_pos, (img_x, img_y), device);
+                    self.gui.last_mouse_pos = Some((img_x, img_y));
+                } else {
+                    self.gui.last_mouse_pos = None;
+                }
+            } else {
+                self.gui.last_mouse_pos = None;
+            }
+        } else {
+            self.gui.last_mouse_pos = None;
+        }
+    }
+
+    fn init_canvas(&mut self, device: &wgpu::Device) {
+        let path = std::path::PathBuf::from("./blank.png");
+
+        let settings = GenerationSettings::default();
+        self.canvas_sim(device, path.clone());
+        self.gui.animate = true;
+
+        self.current_drawing_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        std::thread::spawn({
+            let tx = self.progress_tx.clone();
+            let colors = Arc::clone(&self.colors);
+            let pixel_data = Arc::clone(&self.pixeldata);
+            let frame_count = self.frame_count;
+            let current_id = self.current_drawing_id.clone();
+            let my_id = current_id.load(std::sync::atomic::Ordering::SeqCst);
+            move || {
+                let result = calculate::drawing_process::drawing_process_genetic(
+                    path,
+                    settings,
+                    tx.clone(),
+                    colors,
+                    pixel_data,
+                    frame_count,
+                    my_id,
+                    current_id,
+                );
+                match result {
+                    Ok(()) => {}
+                    Err(err) => {
+                        tx.send(ProgressMsg::Error(err.to_string())).ok();
+                    }
+                }
+            }
+        });
+    }
+}
+
+const DRAWING_ALPHA: f32 = 0.5;
+fn point_to_line_dist(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    if dx == 0.0 && dy == 0.0 {
+        // It's a point not a line segment.
+        ((px - x0).powi(2) + (py - y0).powi(2)).sqrt()
+    } else {
+        // Calculate the t that minimizes the distance.
+        let t = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy);
+        if t < 0.0 {
+            // Beyond the 'x0,y0' end of the segment
+            ((px - x0).powi(2) + (py - y0).powi(2)).sqrt()
+        } else if t > 1.0 {
+            // Beyond the 'x1,y1' end of the segment
+            ((px - x1).powi(2) + (py - y1).powi(2)).sqrt()
+        } else {
+            // Projection falls on the segment
+            let proj_x = x0 + t * dx;
+            let proj_y = y0 + t * dy;
+            ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+        }
     }
 }
 
@@ -1260,311 +1447,6 @@ fn get_presets() -> Vec<PathBuf> {
         .collect()
     } else {
         Vec::new()
-    }
-}
-
-impl App for VoronoiApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut Frame) {
-        let Some(rs) = frame.wgpu_render_state() else {
-            return;
-        };
-
-        let device = &rs.device;
-        // Resize handling (match the egui "central panel" size)
-        //let available = ctx.available_rect();
-        // let target_size = (
-        //     available.width().max(1.0) as u32,
-        //     available.height().max(1.0) as u32,
-        // );
-        // if target_size != self.size {
-        //     self.resize(rs, target_size);
-        // }
-
-        // Ensure texture is registered exactly once per allocation
-        self.ensure_registered_texture(rs);
-
-        // Run GPU pipeline
-
-        self.run_gpu(rs);
-
-        // Optionally animate seeds a bit
-        if self.animate {
-            if self.gif_status.is_recording() {
-                for _ in 0..(60 / GIF_FRAMERATE) {
-                    self.sim.update(&mut self.seeds, self.size.0);
-                }
-
-                if let Err(e) = self.write_frame_to_gif(device, &rs.queue) {
-                    self.gif_status = GifStatus::Error(e.to_string());
-                    self.animate = false;
-                } else {
-                    self.gif_frame_count += 1;
-
-                    if self.gif_frame_count >= GIF_NUM_FRAMES {
-                        // finish recording
-                        // self.stop_recording_gif(device);
-                        if let GifStatus::Recording(Some(path)) = self.gif_status.clone() {
-                            self.gif_status = GifStatus::Complete(path);
-                        } else {
-                            self.gif_status = GifStatus::Error("Something weird happened".into());
-                        }
-
-                        self.animate = false;
-                    }
-                }
-            } else {
-                self.sim.update(&mut self.seeds, self.size.0);
-            }
-            rs.queue
-                .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
-        }
-
-        let dt = self.prev_frame_time.elapsed();
-        self.prev_frame_time = std::time::Instant::now();
-        self.fps_text = format!(
-            "{:5.2} ms/frame (~{:06.0} FPS)",
-            dt.as_secs_f64() * 1000.0,
-            1.0 / dt.as_secs_f64()
-        );
-
-        // ===== UI =====
-        ctx.set_zoom_factor(1.4);
-
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !self.animate,
-                        egui::Button::new("play transformation"), //.fill(egui::Color32::from_rgb(47, 92, 34)),
-                    )
-                    .clicked()
-                {
-                    self.animate = true;
-                }
-                if ui
-                    .add_enabled(self.animate, egui::Button::new("switch target"))
-                    .clicked()
-                {
-                    self.sim.switch();
-                }
-                if ui.button("reload").clicked() {
-                    self.change_sim(device, self.sim.source_path());
-                    self.animate = false;
-                }
-                ui.separator();
-
-                if ui.button("save gif").clicked() {
-                    self.gif_status = GifStatus::Recording(None);
-                    self.resize_textures(device, (GIF_RESOLUTION, GIF_RESOLUTION), false);
-                    self.change_sim(device, self.sim.source_path());
-                    self.animate = true;
-                    for _ in 0..20 {
-                        self.sim.update(&mut self.seeds, self.size.0);
-                    }
-                }
-
-                ui.separator();
-                // choose preset
-                // for (i, preset) in self.presets.clone().into_iter().enumerate() {
-                //     if ui.button(i.to_string()).clicked() {
-                //         self.change_sim(device, preset);
-                //         self.animate = false;
-                //     }
-                // }
-                ui.label("choose preset:");
-                egui::ComboBox::from_label("")
-                    .selected_text(self.sim.name())
-                    .show_ui(ui, |ui| {
-                        for preset in self.presets.clone().into_iter() {
-                            if ui.button(preset_path_to_name(&preset)).clicked() {
-                                // Call change_sim when a new preset is selected
-                                self.change_sim(device, preset);
-                                self.animate = false;
-                            }
-                        }
-                    });
-                ui.separator();
-                if ui.button("obamify new image").clicked() {
-                    // open file select
-                    let file = rfd::FileDialog::new()
-                        .set_title("choose image (square aspect ratio recommended)")
-                        .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
-                        .pick_file();
-                    if let Some(path) = file {
-                        self.show_progress_modal = true;
-                        self.quick_process = false;
-
-                        let settings = GenerationSettings::default();
-                        self.currently_processing = Some(path.clone());
-
-                        std::thread::spawn({
-                            let tx = self.progress_tx.clone();
-                            let cancelled = self.process_cancelled.clone();
-                            move || match calculate::process(path, settings, tx.clone(), cancelled)
-                            {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    tx.send(ProgressMsg::Error(err.to_string())).ok();
-                                }
-                            }
-                        });
-                    }
-                }
-
-                if self.show_progress_modal {
-                    Modal::new("progress_modal".into()).show(ui.ctx(), |ui| {
-                        let processing_label_message = if self.quick_process {
-                            "processing..."
-                        } else {
-                            "processing... (could take a while)"
-                        };
-                        ui.vertical(|ui| {
-                            ui.set_min_width(ui.available_width().min(400.0));
-                            if let Ok(msg) = self.progress_rx.try_recv() {
-                                match msg {
-                                    ProgressMsg::Done(path) => {
-                                        self.presets = get_presets();
-                                        self.change_sim(device, path);
-                                        self.animate = true;
-                                        self.show_progress_modal = false;
-                                        ui.close();
-                                    }
-                                    ProgressMsg::Progress(p) => {
-                                        ui.label(processing_label_message);
-                                        self.last_progress = p;
-                                        ui.add(egui::ProgressBar::new(p).show_percentage());
-                                    }
-                                    ProgressMsg::Error(err) => {
-                                        ui.label(format!("error: {}", err));
-                                        if ui.button("close").clicked() {
-                                            ui.close();
-                                        }
-                                    }
-                                    ProgressMsg::Cancelled => {
-                                        self.process_cancelled
-                                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                                        if self.quick_process {
-                                            let settings = GenerationSettings::quick_process();
-
-                                            std::thread::spawn({
-                                                let tx = self.progress_tx.clone();
-                                                let cancelled = self.process_cancelled.clone();
-                                                let path =
-                                                    self.currently_processing.clone().unwrap();
-                                                move || match calculate::process(
-                                                    path,
-                                                    settings,
-                                                    tx.clone(),
-                                                    cancelled,
-                                                ) {
-                                                    Ok(()) => {}
-                                                    Err(err) => {
-                                                        tx.send(ProgressMsg::Error(
-                                                            err.to_string(),
-                                                        ))
-                                                        .ok();
-                                                    }
-                                                }
-                                            });
-                                        } else {
-                                            self.show_progress_modal = false;
-                                            ui.close();
-                                        }
-                                    }
-                                }
-                            } else {
-                                if self
-                                    .process_cancelled
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                {
-                                    ui.label("cancelling...");
-                                } else {
-                                    ui.label(processing_label_message);
-                                }
-                                ui.add(
-                                    egui::ProgressBar::new(self.last_progress).show_percentage(),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.button("cancel").clicked() {
-                                    self.quick_process = false;
-                                    self.process_cancelled
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    self.last_progress = 0.0;
-                                }
-
-                                if !self.quick_process
-                                    && ui
-                                        .button("make faster, lower quality result instead")
-                                        .clicked()
-                                {
-                                    self.process_cancelled
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    self.last_progress = 0.0;
-                                    self.quick_process = true;
-                                }
-                            })
-                        });
-                    });
-
-                    // if modal.should_close() {
-                    //     self.show_progress_modal = false;
-                    // }
-                } else if !self.gif_status.not_recording() {
-                    Modal::new("recording_progress".into()).show(ui.ctx(), |ui| {
-                        match self.gif_status.clone() {
-                            GifStatus::Recording(_) => {
-                                ui.label("Recording GIF...");
-                            }
-
-                            GifStatus::Error(err) => {
-                                ui.label(format!("Error: {}", err));
-                                ui.horizontal(|ui| {
-                                    if ui.button("close").clicked() {
-                                        self.stop_recording_gif(device);
-                                    }
-                                });
-                            }
-                            GifStatus::Complete(path) => {
-                                ui.label("gif saved!");
-                                ui.horizontal(|ui| {
-                                    if ui.button("open folder").clicked() {
-                                        if let Some(parent) = path.parent() {
-                                            opener::open(parent).ok();
-                                        }
-                                    }
-                                    if ui.button("close").clicked() {
-                                        self.stop_recording_gif(device);
-                                    }
-                                });
-                            }
-                            GifStatus::None => unreachable!(),
-                        }
-                    });
-                }
-
-                // ui.separator();
-                // ui.label(&self.fps_text);
-            });
-        });
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new())
-            .show(ctx, |ui| {
-                ui.vertical_centered_justified(|ui| {
-                    if let Some(id) = self.egui_tex_id {
-                        let full = ui.available_size();
-                        let aspect = self.size.0 as f32 / self.size.1 as f32;
-                        let desired = full.x.min(full.y) * egui::vec2(1.0, aspect);
-                        ui.add(egui::Image::new((id, desired)).maintain_aspect_ratio(true));
-                    } else {
-                        ui.colored_label(Color32::LIGHT_RED, "Texture not ready");
-                    }
-                });
-            });
-
-        // continuous repaint for animation
-        ctx.request_repaint();
     }
 }
 
