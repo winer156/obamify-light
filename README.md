@@ -23,12 +23,3 @@ Install the latest version in [releases](https://github.com/Spu7Nix/obamify/rele
 # How it works
 
 magic
-
-# Contributing
-
-Here are some ideas for features to implement if you're interested:
-- Faster algorithms for calculating the image transformation
-- Better user experience with saving/loading presets
-- Building for web/WASM
-
-Feel free to make an issue or a pull request if you have any ideas :)
