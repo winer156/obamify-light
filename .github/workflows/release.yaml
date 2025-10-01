@@ -61,7 +61,8 @@ jobs:
 
           test -f target.png || (echo "./target.png missing" && exit 1)
           test -f weights.png || (echo "./weights.png missing" && exit 1)
-          cp target.png weights.png "$PKG/"
+          test -f blank.png || (echo "./weights.png missing" && exit 1)
+          cp target.png weights.png blank.png "$PKG/"
 
           (cd dist && ${{ matrix.zip_cmd }} "${APP}-${{ matrix.os_tag }}.zip" "${APP}-${{ matrix.os_tag }}")
 
@@ -84,7 +85,8 @@ jobs:
 
           if (-not (Test-Path "target.png")) { throw "./target.png missing" }
           if (-not (Test-Path "weights.png")) { throw "./weights.png missing" }
-          Copy-Item "target.png","weights.png" -Destination $Pkg -Force
+          if (-not (Test-Path "blank.png")) { throw "./blank.png missing" }
+          Copy-Item "target.png","weights.png","blank.png" -Destination $Pkg -Force
 
           Compress-Archive -Path "$Pkg/*" -DestinationPath "dist/$App-${{ matrix.os_tag }}.zip" -Force
 
