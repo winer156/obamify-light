@@ -772,7 +772,7 @@ impl ObamifyApp {
             w
         };
 
-        web_sys::console::log_1(&"worker created".into());
+        //web_sys::console::log_1(&"worker created".into());
 
         // Receive progress messages
         {
