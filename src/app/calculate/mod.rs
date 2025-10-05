@@ -1,37 +1,72 @@
-use std::{
-    error::Error,
-    path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 pub mod drawing_process;
 pub mod util;
+#[cfg(target_arch = "wasm32")]
+pub mod worker;
+#[cfg(target_arch = "wasm32")]
+use eframe::web;
+
+fn _debug_print(s: String) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::log_1(&s.into());
+    #[cfg(not(target_arch = "wasm32"))]
+    println!("{}", s);
+}
 
 use egui::ahash::AHasher;
-use image::GenericImageView;
+use image::{GenericImageView, ImageBuffer};
 use pathfinding::prelude::Weights;
-use rand::Rng;
-use std::sync::mpsc;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-#[derive(Clone, Copy)]
+use crate::app::preset::{Preset, UnprocessedPreset};
+
+pub trait ProgressSink {
+    fn send(&mut self, msg: ProgressMsg);
+}
+// Native-friendly adapter
+impl ProgressSink for std::sync::mpsc::SyncSender<ProgressMsg> {
+    fn send(&mut self, msg: ProgressMsg) {
+        let _ = std::sync::mpsc::SyncSender::send(self, msg);
+    }
+}
+
+// Allow using closures as progress sinks in WASM
+impl<T> ProgressSink for T
+where
+    T: FnMut(crate::app::calculate::ProgressMsg),
+{
+    fn send(&mut self, msg: crate::app::calculate::ProgressMsg) {
+        self(msg);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Algorithm {
     Optimal,
     Genetic,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GenerationSettings {
+    pub name: String,
     pub proximity_importance: i64,
     pub algorithm: Algorithm,
     pub rescale: Option<u32>,
+    pub id: Uuid,
 }
 
+pub type SourceImg = ImageBuffer<image::Rgb<u8>, Vec<u8>>;
+
 impl GenerationSettings {
-    pub fn default() -> Self {
+    pub fn default(id: Uuid, name: String) -> Self {
         Self {
+            name,
             proximity_importance: 10, // 20
             algorithm: Algorithm::Genetic,
             rescale: None,
+            id,
         }
     }
 
@@ -67,8 +102,8 @@ struct ImgDiffWeights {
     settings: GenerationSettings,
 }
 
-const TARGET_IMAGE_PATH: &str = "./target.png";
-const TARGET_WEIGHTS_PATH: &str = "./weights.png";
+// const TARGET_IMAGE_PATH: &str = "./target.png";
+// const TARGET_WEIGHTS_PATH: &str = "./weights.png";
 
 impl Weights<i64> for ImgDiffWeights {
     fn rows(&self) -> usize {
@@ -101,26 +136,50 @@ impl Weights<i64> for ImgDiffWeights {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub enum ProgressMsg {
     Progress(f32),
-    UpdatePreview(image::ImageBuffer<image::Rgb<u8>, Vec<u8>>),
+    UpdatePreview {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
     UpdateAssignments(Vec<usize>),
-    Done(PathBuf), // result directory
+    Done(Preset), // result directory
     Error(String),
     Cancelled,
 }
 
+impl ProgressMsg {
+    pub fn typ(&self) -> &'static str {
+        match self {
+            ProgressMsg::Progress(_) => "progress",
+            ProgressMsg::UpdatePreview { .. } => "update_preview",
+            ProgressMsg::UpdateAssignments(_) => "update_assignments",
+            ProgressMsg::Done(_) => "done",
+            ProgressMsg::Error(_) => "error",
+            ProgressMsg::Cancelled => "cancelled",
+        }
+    }
+}
+
 type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<AHasher>>;
 
-pub fn process_optimal<P: AsRef<Path>>(
-    source_path: P,
+pub fn process_optimal<S: ProgressSink>(
+    unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
-    tx: mpsc::SyncSender<ProgressMsg>,
-    cancelled: Arc<AtomicBool>,
-) -> Result<(), Box<dyn Error>> {
-    let start_time = std::time::Instant::now();
-    let (target, base_name, source, source_pixels, target_pixels, weights) =
-        util::get_images(source_path, &settings)?;
+    tx: &mut S,
+    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_img = image::ImageBuffer::from_vec(
+        unprocessed.width,
+        unprocessed.height,
+        unprocessed.source_img.clone(),
+    )
+    .unwrap();
+    // let start_time = std::time::Instant::now();
+    let (target, source, source_pixels, target_pixels, weights) =
+        util::get_images(source_img, &settings)?;
 
     let weights = ImgDiffWeights {
         source: source_pixels.clone(),
@@ -129,6 +188,7 @@ pub fn process_optimal<P: AsRef<Path>>(
         sidelen: target.width() as usize,
         settings,
     };
+
     // pathfinding::kuhn_munkres, inlined to allow for progress bar and cancelling
     let (_total_diff, assignments) = {
         // We call x the rows and y the columns. (nx, ny) is the size of the matrix.
@@ -232,13 +292,17 @@ pub fn process_optimal<P: AsRef<Path>>(
                 xy[x] = y;
                 y = prec;
             }
-            if root.is_multiple_of(100) {
+            if root % 100 == 0 {
                 // send progress
-                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    tx.send(ProgressMsg::Cancelled).unwrap();
-                    return Ok(());
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        tx.send(ProgressMsg::Cancelled);
+                        return Ok(());
+                    }
                 }
-                tx.send(ProgressMsg::Progress(root as f32 / nx as f32))?;
+
+                tx.send(ProgressMsg::Progress(root as f32 / nx as f32));
 
                 let img = make_new_img(
                     &source_pixels,
@@ -249,7 +313,11 @@ pub fn process_optimal<P: AsRef<Path>>(
                     target.width(),
                 );
 
-                tx.send(ProgressMsg::UpdatePreview(img))?;
+                tx.send(ProgressMsg::UpdatePreview {
+                    width: img.width(),
+                    height: img.height(),
+                    data: img.into_raw(),
+                });
             }
         }
         (
@@ -258,29 +326,29 @@ pub fn process_optimal<P: AsRef<Path>>(
         )
     };
 
-    let img = make_new_img(&source_pixels, &assignments, target.width());
+    //let img = make_new_img(&source_pixels, &assignments, target.width());
 
-    let dir_name = util::save_result(target, base_name, source, assignments, img)?;
+    //let dir_name = util::save_result(target, "todo".to_string(), source, assignments, img)?;
 
-    tx.send(ProgressMsg::Done(PathBuf::from(format!(
-        "./presets/{}",
-        dir_name
-    ))))?;
+    tx.send(ProgressMsg::Done(Preset {
+        inner: UnprocessedPreset {
+            name: unprocessed.name,
+            width: source.width(),
+            height: source.height(),
+            source_img: source.into_raw(),
+        },
+        assignments: assignments.clone(),
+    }));
 
-    println!(
-        "finished in {:.2?} seconds",
-        std::time::Instant::now().duration_since(start_time)
-    );
-
+    // println!(
+    //     "finished in {:.2?} seconds",
+    //     std::time::Instant::now().duration_since(start_time)
+    // );
     Ok(())
 }
 
-fn make_new_img(
-    source_pixels: &[(u8, u8, u8)],
-    assignments: &[usize],
-    sidelen: u32,
-) -> image::ImageBuffer<image::Rgb<u8>, Vec<u8>> {
-    let mut img = image::ImageBuffer::new(sidelen, sidelen);
+fn make_new_img(source_pixels: &[(u8, u8, u8)], assignments: &[usize], sidelen: u32) -> SourceImg {
+    let mut img = SourceImg::new(sidelen, sidelen);
 
     for (target_idx, source_idx) in assignments.iter().enumerate() {
         let (x, y) = (
@@ -334,23 +402,34 @@ impl Pixel {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const SWAPS_PER_GENERATION: usize = 200000;
 
-pub fn process_genetic<P: AsRef<Path>>(
-    source_path: P,
+#[cfg(target_arch = "wasm32")]
+const SWAPS_PER_GENERATION: usize = 500000; // for some reason wasm is like 5x faster
+
+pub fn process_genetic<S: ProgressSink>(
+    unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
-    tx: mpsc::SyncSender<ProgressMsg>,
-    cancelled: Arc<AtomicBool>,
-) -> Result<(), Box<dyn Error>> {
-    let (target, base_name, source, source_pixels, target_pixels, weights) =
-        util::get_images(source_path, &settings)?;
+    tx: &mut S,
+    #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_img = image::ImageBuffer::from_vec(
+        unprocessed.width,
+        unprocessed.height,
+        unprocessed.source_img.clone(),
+    )
+    .unwrap();
+    // let start_time = std::time::Instant::now();
+    let (target, source, source_pixels, target_pixels, weights) =
+        util::get_images(source_img, &settings)?;
 
     let mut pixels = source_pixels
         .iter()
         .enumerate()
         .map(|(i, &(r, g, b))| {
-            let x = (i as u32 % source.width()) as u16;
-            let y = (i as u32 / source.width()) as u16;
+            let x = (i as u32 % target.width()) as u16;
+            let y = (i as u32 / target.width()) as u16;
             let mut p = Pixel::new(x, y, (r, g, b), 0);
             let h = p.calc_heuristic(
                 (x, y),
@@ -363,17 +442,18 @@ pub fn process_genetic<P: AsRef<Path>>(
         })
         .collect::<Vec<_>>();
 
-    let mut rng = rand::thread_rng();
+    let mut rng = frand::Rand::with_seed(12345);
+
     let mut max_dist = target.width();
     loop {
         let mut swaps_made = 0;
         for _ in 0..SWAPS_PER_GENERATION {
-            let apos = rng.gen_range(0..pixels.len());
+            let apos = rng.gen_range(0..pixels.len() as u32) as usize;
             let ax = apos as u16 % target.width() as u16;
             let ay = apos as u16 / target.width() as u16;
-            let bx = (ax as i16 + rng.gen_range(-(max_dist as i16)..=(max_dist as i16)))
+            let bx = (ax as i16 + rng.gen_range(-(max_dist as i16)..(max_dist as i16 + 1)))
                 .clamp(0, target.width() as i16 - 1) as u16;
-            let by = (ay as i16 + rng.gen_range(-(max_dist as i16)..=(max_dist as i16)))
+            let by = (ay as i16 + rng.gen_range(-(max_dist as i16)..(max_dist as i16 + 1)))
                 .clamp(0, target.width() as i16 - 1) as u16;
             let bpos = by as usize * target.width() as usize + bx as usize;
 
@@ -404,23 +484,43 @@ pub fn process_genetic<P: AsRef<Path>>(
                 swaps_made += 1;
             }
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                println!("cancelled");
+                tx.send(ProgressMsg::Cancelled);
+                return Ok(());
+            }
+        }
+
         let assignments = pixels
             .iter()
-            .map(|p| p.src_y as usize * source.width() as usize + p.src_x as usize)
+            .map(|p| p.src_y as usize * target.width() as usize + p.src_x as usize)
             .collect::<Vec<_>>();
-        let img = make_new_img(&source_pixels, &assignments, target.width());
-        if swaps_made < 10 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            let dir_name = util::save_result(target, base_name, source, assignments, img)?;
-            tx.send(ProgressMsg::Done(PathBuf::from(format!(
-                "./presets/{}",
-                dir_name
-            ))))?;
+        //debug_print(format!("max_dist = {max_dist}, swaps made = {swaps_made}"));
+        if max_dist < 4 && swaps_made < 10 {
+            //let dir_name = util::save_result(target, base_name, source, assignments, img)?;
+            tx.send(ProgressMsg::Done(Preset {
+                inner: UnprocessedPreset {
+                    name: unprocessed.name,
+                    width: source.width(),
+                    height: source.height(),
+                    source_img: source.into_raw(),
+                },
+                assignments: assignments.clone(),
+            }));
             return Ok(());
         }
-        tx.send(ProgressMsg::UpdatePreview(img))?;
+        let img = make_new_img(&source_pixels, &assignments, target.width());
+        tx.send(ProgressMsg::UpdatePreview {
+            width: img.width(),
+            height: img.height(),
+            data: img.into_raw(),
+        });
         tx.send(ProgressMsg::Progress(
             1.0 - max_dist as f32 / target.width() as f32,
-        ))?;
+        ));
 
         max_dist = (max_dist as f32 * 0.99).max(2.0) as u32;
     }
@@ -436,25 +536,37 @@ fn load_weights(source: &image::DynamicImage) -> Vec<i64> {
     weights
 }
 
-fn serialize_assignments(assignments: Vec<usize>) -> String {
-    format!(
-        "[{}]",
-        assignments
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+// fn serialize_assignments(assignments: Vec<usize>) -> String {
+//     format!(
+//         "[{}]",
+//         assignments
+//             .iter()
+//             .map(|a| a.to_string())
+//             .collect::<Vec<_>>()
+//             .join(",")
+//     )
+// }
+#[cfg(not(target_arch = "wasm32"))]
+pub fn process<S: ProgressSink>(
+    unprocessed: UnprocessedPreset,
+    settings: GenerationSettings,
+    tx: &mut S,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match settings.algorithm {
+        Algorithm::Optimal => process_optimal(unprocessed, settings, tx, cancel),
+        Algorithm::Genetic => process_genetic(unprocessed, settings, tx, cancel),
+    }
 }
 
-pub fn process(
-    source_path: PathBuf,
+#[cfg(target_arch = "wasm32")]
+pub fn process<S: ProgressSink>(
+    unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
-    tx: mpsc::SyncSender<ProgressMsg>,
-    cancelled: Arc<AtomicBool>,
-) -> Result<(), Box<dyn Error>> {
+    tx: &mut S,
+) -> Result<(), Box<dyn std::error::Error>> {
     match settings.algorithm {
-        Algorithm::Optimal => process_optimal(source_path, settings, tx, cancelled),
-        Algorithm::Genetic => process_genetic(source_path, settings, tx, cancelled),
+        Algorithm::Optimal => process_optimal(unprocessed, settings, tx),
+        Algorithm::Genetic => process_genetic(unprocessed, settings, tx),
     }
 }

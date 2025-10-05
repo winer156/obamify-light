@@ -1,19 +1,18 @@
-use rand::Rng;
+use crate::app::SeedColor;
+use crate::app::calculate;
+use crate::app::preset::UnprocessedPreset;
 
 use super::SWAPS_PER_GENERATION;
 
 use std::error::Error;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::mpsc;
-use std::sync::Arc;
 
 use super::ProgressMsg;
 
 use super::GenerationSettings;
-
-use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub struct PixelData {
@@ -35,8 +34,6 @@ impl PixelData {
 pub const DRAWING_CANVAS_SIZE: usize = 128;
 
 use super::heuristic;
-
-use crate::SeedColor;
 
 #[derive(Clone, Copy)]
 pub(crate) struct DrawingPixel {
@@ -98,7 +95,7 @@ pub(crate) fn stroke_reward(
     let data = pixel_data
         [pixels[oldpos].src_x as usize + pixels[oldpos].src_y as usize * DRAWING_CANVAS_SIZE];
     let stroke_id = data.stroke_id;
-    let age = frame_count - data.last_edited;
+    let _age = frame_count - data.last_edited;
 
     for (dx, dy) in [
         //(-1, -1),
@@ -128,18 +125,22 @@ pub(crate) fn stroke_reward(
     0
 }
 
-pub fn drawing_process_genetic<P: AsRef<Path>>(
-    source_path: P,
+#[allow(clippy::too_many_arguments)]
+pub fn drawing_process_genetic(
+    source: UnprocessedPreset,
     settings: GenerationSettings,
     tx: mpsc::SyncSender<ProgressMsg>,
-    colors: Arc<std::sync::RwLock<Vec<crate::SeedColor>>>,
+    colors: Arc<std::sync::RwLock<Vec<SeedColor>>>,
     pixel_data: Arc<std::sync::RwLock<Vec<PixelData>>>,
     frame_count: u32,
     my_id: u32,
     current_id: Arc<AtomicU32>,
 ) -> Result<(), Box<dyn Error>> {
-    let (target, base_name, source, source_pixels, target_pixels, weights) =
-        crate::calculate::util::get_images(source_path, &settings)?;
+    let source_img =
+        image::ImageBuffer::from_raw(source.width, source.height, source.source_img.clone())
+            .unwrap();
+    let (target, source, source_pixels, target_pixels, weights) =
+        calculate::util::get_images(source_img, &settings)?;
 
     let mut pixels = {
         let read_colors: Vec<SeedColor> = colors.read().unwrap().clone();
@@ -166,7 +167,7 @@ pub fn drawing_process_genetic<P: AsRef<Path>>(
             .collect::<Vec<_>>()
     };
 
-    let mut rng = rand::thread_rng();
+    let mut rng = frand::Rand::with_seed(12345);
     fn max_dist(age: u32) -> u32 {
         (((DRAWING_CANVAS_SIZE / 4) as f32) * (0.99f32).powi(age as i32 / 30)).round() as u32
     }
@@ -183,16 +184,16 @@ pub fn drawing_process_genetic<P: AsRef<Path>>(
         let mut swaps_made = 0;
 
         for _ in 0..SWAPS_PER_GENERATION {
-            let apos = rng.gen_range(0..pixels.len());
+            let apos = rng.gen_range(0..pixels.len() as u64) as usize;
             let ax = apos as u16 % target.width() as u16;
             let ay = apos as u16 / target.width() as u16;
 
             //let stroke_id = pixel_data[apos].stroke_id as usize;
             let max_dist_a = max_dist(frame_count.saturating_sub(pixel_data[apos].last_edited));
 
-            let bx = (ax as i16 + rng.gen_range(-(max_dist_a as i16)..=(max_dist_a as i16)))
+            let bx = (ax as i16 + rng.gen_range(-(max_dist_a as i16)..(max_dist_a as i16 + 1)))
                 .clamp(0, target.width() as i16 - 1) as u16;
-            let by = (ay as i16 + rng.gen_range(-(max_dist_a as i16)..=(max_dist_a as i16)))
+            let by = (ay as i16 + rng.gen_range(-(max_dist_a as i16)..(max_dist_a as i16 + 1)))
                 .clamp(0, target.width() as i16 - 1) as u16;
             let bpos = by as usize * target.width() as usize + bx as usize;
 

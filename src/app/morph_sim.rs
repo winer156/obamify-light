@@ -1,26 +1,24 @@
-use std::{
-    fs, mem,
-    path::{Path, PathBuf},
-    time::Instant,
+use std::mem;
+
+use image::ImageBuffer;
+
+use crate::app::{
+    SeedColor, SeedPos,
+    preset::{Preset, UnprocessedPreset},
 };
 
-use crate::{SeedColor, SeedPos};
-use image::GenericImageView;
-const DST_FORCE: f32 = 0.2;
-pub fn init_image(sidelen: u32, source: PathBuf) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
-    let imgpath = source.join("source.png");
-    let assignments = fs::read_to_string(source.join("assignments.json"))
-        .unwrap()
-        .strip_prefix('[')
-        .unwrap()
-        .strip_suffix(']')
-        .unwrap()
-        .split(',')
-        .map(|s| s.parse().unwrap())
-        .collect::<Vec<usize>>();
+// const DST_FORCE: f32 = 0.2;
+pub fn init_image(sidelen: u32, source: Preset) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
+    let imgpath = image::ImageBuffer::from_vec(
+        source.inner.width,
+        source.inner.height,
+        source.inner.source_img,
+    )
+    .unwrap();
+    let assignments = source.assignments;
 
     let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
-    let mut sim = Sim::new(source);
+    let mut sim = Sim::new(source.inner.name);
     sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
 
     sim.set_assignments(assignments, sidelen);
@@ -30,22 +28,27 @@ pub fn init_image(sidelen: u32, source: PathBuf) -> (u32, Vec<SeedPos>, Vec<Seed
     (seeds_n as u32, seeds, colors, sim)
 }
 
-pub fn init_canvas(sidelen: u32, source: PathBuf) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
-    use crate::calculate::drawing_process::DRAWING_CANVAS_SIZE;
-    let imgpath = source.clone();
+pub fn init_canvas(
+    sidelen: u32,
+    source: UnprocessedPreset,
+) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
+    use crate::app::calculate::drawing_process::DRAWING_CANVAS_SIZE;
+    let imgpath =
+        image::ImageBuffer::from_vec(source.width, source.height, source.source_img).unwrap();
     let assignments = (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>();
 
     let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
-    let mut sim = Sim::new(source);
+    let mut sim = Sim::new(source.name);
     sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.0); seeds_n];
 
     sim.set_assignments(assignments, sidelen);
     (seeds_n as u32, seeds, colors, sim)
 }
 
-fn init_colors(sidelen: u32, imgpath: PathBuf) -> (Vec<SeedPos>, Vec<SeedColor>, usize) {
-    let mut source = image::open(imgpath).unwrap().to_rgb8();
-
+fn init_colors(
+    sidelen: u32,
+    source: ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+) -> (Vec<SeedPos>, Vec<SeedColor>, usize) {
     let mut seeds = Vec::new();
     let mut colors = Vec::new();
 
@@ -182,8 +185,25 @@ impl CellBody {
             self.accy -= dy * weight;
         } else if dist.abs() < f32::EPSILON {
             // if they are exactly on top of each other, push in a random direction
-            self.accx += (rand::random::<f32>() - 0.5) * 0.1;
-            self.accy += (rand::random::<f32>() - 0.5) * 0.1;
+            // deterministic pseudo-random push based on position
+            let x_bits = pos.xy[0].to_bits();
+            let y_bits = pos.xy[1].to_bits();
+            let mut h = x_bits ^ y_bits.rotate_left(16) ^ 0x9E3779B9;
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x85EB_CA6B);
+            h ^= h >> 13;
+            let hx = h;
+
+            let mut h2 = hx ^ 0xC2B2_AE35;
+            h2 ^= h2 >> 16;
+            h2 = h2.wrapping_mul(0x27D4_EB2D);
+            h2 ^= h2 >> 15;
+
+            let r1 = (hx as f32) / (u32::MAX as f32); // [0, 1)
+            let r2 = (h2 as f32) / (u32::MAX as f32); // [0, 1)
+
+            self.accx += (r1 - 0.5) * 0.1;
+            self.accy += (r2 - 0.5) * 0.1;
         }
 
         weight.max(0.0)
@@ -214,25 +234,25 @@ impl CellBody {
 pub struct Sim {
     //elapsed_frames: u32,
     pub cells: Vec<CellBody>,
-    source: PathBuf,
+    name: String,
 }
 
 impl Sim {
-    pub fn new(source_dir: PathBuf) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
             cells: Vec::new(),
             //elapsed_frames: 0,
-            source: source_dir,
+            name,
         }
     }
 
     pub fn name(&self) -> String {
-        preset_path_to_name(&self.source)
+        self.name.clone()
     }
 
-    pub fn source_path(&self) -> PathBuf {
-        self.source.clone()
-    }
+    // pub fn source_path(&self) -> PathBuf {
+    //     self.source.clone()
+    // }
 
     pub fn switch(&mut self) {
         for cell in &mut self.cells {
@@ -242,7 +262,7 @@ impl Sim {
         }
     }
 
-    pub fn update(&mut self, positions: &mut Vec<SeedPos>, sidelen: u32) {
+    pub fn update(&mut self, positions: &mut [SeedPos], sidelen: u32) {
         let grid_size = (self.cells.len() as f32).sqrt();
         let pixel_size = sidelen as f32 / grid_size;
         //dbg!(grid_size, pixel_size);
@@ -347,10 +367,10 @@ impl Sim {
     }
 }
 
-pub fn preset_path_to_name(source_dir: &Path) -> String {
-    source_dir
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned()
-}
+// pub fn preset_path_to_name(source_dir: &Path) -> String {
+//     source_dir
+//         .file_stem()
+//         .unwrap()
+//         .to_string_lossy()
+//         .into_owned()
+// }
