@@ -16,16 +16,12 @@ use crate::app::preset::Preset;
 use crate::app::preset::UnprocessedPreset;
 use eframe::App;
 use eframe::Frame;
-use egui::ImageSource;
+use egui::Color32;
 use egui::Modal;
 use egui::TextureHandle;
 use egui::Window;
-use egui::{Color32, ColorImage};
-use egui_wgpu::Texture;
 use image::buffer::ConvertBuffer;
 use image::imageops;
-use palette::blend;
-use serde::de::value;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -46,16 +42,16 @@ pub(crate) struct GuiState {
     pub last_mouse_pos: Option<(f32, f32)>,
     #[cfg(not(target_arch = "wasm32"))]
     pub drawing_color: [f32; 4],
-    pub mode: GuiMode,
+    mode: GuiMode,
     pub animate: bool,
     //pub fps_text: String,
-    pub show_progress_modal: Option<Uuid>,
-    pub last_progress: f32,
-    pub process_cancelled: Arc<AtomicBool>,
+    show_progress_modal: Option<Uuid>,
+    last_progress: f32,
+    process_cancelled: Arc<AtomicBool>,
     //pub currently_processing: Option<Preset>,
     pub presets: Vec<Preset>,
     //pub current_settings: GenerationSettings,
-    pub configuring_generation: Option<(SourceImg, GenerationSettings, GuiImageCache)>,
+    configuring_generation: Option<(SourceImg, GenerationSettings, GuiImageCache)>,
     pub current_preset: usize,
 }
 
@@ -312,6 +308,7 @@ impl App for ObamifyApp {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("choose preset:");
                                 egui::ComboBox::from_label("")
+                                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                     .selected_text({
                                         let name = self.sim.name();
                                         if name.chars().count() > 13 {
@@ -365,13 +362,6 @@ impl App for ObamifyApp {
                                                     ),
                                                 );
 
-                                                if preset_resp.clicked() {
-                                                    self.change_sim(device, preset.clone(), i);
-                                                    self.gui.animate = false;
-                                                    self.gui.current_preset = i;
-                                                    close_menu = true;
-                                                }
-
                                                 if remove_enabled
                                                     && ui
                                                         .small_button("x")
@@ -379,6 +369,11 @@ impl App for ObamifyApp {
                                                         .clicked()
                                                 {
                                                     to_remove = Some(i);
+                                                } else if preset_resp.clicked() {
+                                                    self.change_sim(device, preset.clone(), i);
+                                                    self.gui.animate = false;
+                                                    self.gui.current_preset = i;
+                                                    close_menu = true;
                                                 }
                                             });
                                         }
@@ -488,6 +483,9 @@ impl App for ObamifyApp {
 
                             ui.separator();
 
+                            let mut change_source = false;
+                            let mut change_target = false;
+
                             ui.allocate_ui_with_layout(
                                 egui::vec2(max_w, 0.0),
                                 egui::Layout::left_to_right(egui::Align::Center)
@@ -498,8 +496,8 @@ impl App for ObamifyApp {
                                     if let Some((source_img, settings, cache)) =
                                         self.gui.configuring_generation.as_mut()
                                     {
-                                        image_crop_gui(
-                                            "source image",
+                                        change_source = image_crop_gui(
+                                            "source",
                                             ui,
                                             source_img,
                                             &mut settings.source_crop_scale,
@@ -527,8 +525,8 @@ impl App for ObamifyApp {
                                             });
                                         }
 
-                                        image_crop_gui(
-                                            "target image",
+                                        change_target = image_crop_gui(
+                                            "target",
                                             ui,
                                             &settings.get_raw_target(),
                                             &mut settings.target_crop_scale,
@@ -537,6 +535,36 @@ impl App for ObamifyApp {
                                     }
                                 },
                             );
+
+                            if change_source {
+                                prompt_image(
+                                    "choose image to obamify",
+                                    self,
+                                    |_, mut img: SourceImg, app: &mut ObamifyApp| {
+                                        img = ensure_reasonable_size(img);
+                                        if let Some((src, _, cache)) =
+                                            &mut app.gui.configuring_generation
+                                        {
+                                            *src = img;
+                                            cache.source_preview = None;
+                                        }
+                                    },
+                                );
+                            } else if change_target {
+                                prompt_image(
+                                    "choose custom target image",
+                                    self,
+                                    |_, mut img: SourceImg, app: &mut ObamifyApp| {
+                                        img = ensure_reasonable_size(img);
+                                        if let Some((_, settings, cache)) =
+                                            &mut app.gui.configuring_generation
+                                        {
+                                            settings.set_raw_target(img);
+                                            cache.target_preview = None;
+                                        }
+                                    },
+                                );
+                            }
 
                             ui.separator();
 
@@ -1070,7 +1098,8 @@ fn image_crop_gui(
     img: &SourceImg,
     crop_scale: &mut CropScale,
     cache: &mut Option<TextureHandle>,
-) {
+) -> bool {
+    let mut open_file_dialog = false;
     ui.vertical(|ui| {
         let tex = match &cache {
             None => {
@@ -1085,7 +1114,9 @@ fn image_crop_gui(
             Some(t) => t.clone(),
         };
         ui.add(egui::Image::from_texture(&tex));
-
+        if ui.button(format!("change {name} image")).clicked() {
+            open_file_dialog = true;
+        }
         // crop sliders
         ui.vertical(|ui| {
             let values = *crop_scale;
@@ -1115,6 +1146,8 @@ fn image_crop_gui(
             }
         });
     });
+
+    open_file_dialog
 }
 
 fn get_default_preset_name(mut n: String) -> String {

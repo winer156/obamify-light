@@ -1,6 +1,5 @@
 use crate::app::calculate::ProgressMsg;
 
-use image::ImageBuffer;
 use image::imageops;
 use serde::Deserialize;
 use serde::Serialize;
@@ -9,11 +8,11 @@ use uuid::Uuid;
 use std::error::Error;
 
 // pub(crate) fn save_result(
-//     target: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+//     target: image::SourceImg,
 //     base_name: String,
-//     source: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+//     source: image::SourceImg,
 //     assignments: Vec<usize>,
-//     img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+//     img: image::SourceImg,
 // ) -> Result<String, Box<dyn Error>> {
 //     let mut dir_name = base_name.clone();
 //     let mut counter = 1;
@@ -54,7 +53,7 @@ where
 
 #[allow(clippy::type_complexity)]
 pub(crate) fn get_images(
-    source: ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    source: SourceImg,
     settings: &GenerationSettings,
 ) -> Result<(Vec<(u8, u8, u8)>, Vec<(u8, u8, u8)>, Vec<i64>), Box<dyn Error>> {
     let source = settings.source_crop_scale.apply(&source, settings.sidelen);
@@ -88,11 +87,7 @@ impl CropScale {
         }
     }
 
-    pub fn apply(
-        &self,
-        img: &ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-        sidelen: u32,
-    ) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    pub fn apply(&self, img: &SourceImg, sidelen: u32) -> SourceImg {
         let (w, h) = img.dimensions();
 
         let s = self.scale.max(1.0);
@@ -136,7 +131,7 @@ pub struct GenerationSettings {
     pub algorithm: Algorithm,
 
     pub sidelen: u32,
-    pub custom_target: Option<(u32, u32, Vec<u8>)>,
+    custom_target: Option<(u32, u32, Vec<u8>)>,
     pub target_crop_scale: CropScale,
     pub source_crop_scale: CropScale,
 }
@@ -161,7 +156,7 @@ impl GenerationSettings {
         let target = self.get_raw_target();
         let target = self.target_crop_scale.apply(&target, self.sidelen);
         let weights = if self.custom_target.is_some() {
-            vec![1; (self.sidelen * self.sidelen) as usize] // uniform weights
+            vec![255; (self.sidelen * self.sidelen) as usize] // uniform weights
         } else {
             let target_weights =
                 image::load_from_memory(include_bytes!("weights256.png"))?.to_rgb8();
@@ -172,7 +167,7 @@ impl GenerationSettings {
         Ok((target, weights))
     }
 
-    pub(crate) fn get_raw_target(&self) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    pub(crate) fn get_raw_target(&self) -> SourceImg {
         if let Some((w, h, data)) = &self.custom_target {
             image::ImageBuffer::from_vec(*w, *h, data.clone()).unwrap()
         } else {
@@ -180,6 +175,12 @@ impl GenerationSettings {
                 .unwrap()
                 .to_rgb8()
         }
+    }
+
+    pub(crate) fn set_raw_target(&mut self, img: SourceImg) {
+        let (w, h) = img.dimensions();
+        let data = img.into_raw();
+        self.custom_target = Some((w, h, data));
     }
 }
 
