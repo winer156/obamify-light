@@ -812,21 +812,24 @@ impl App for ObamifyApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(ctx, |ui| {
-                ui.vertical_centered_justified(|ui| {
-                    if let Some(id) = self.egui_tex_id {
-                        let full = ui.available_size();
-                        let aspect = self.size.0 as f32 / self.size.1 as f32;
-                        let desired = full.x.min(full.y) * egui::vec2(1.0, aspect);
-                        ui.add(egui::Image::new((id, desired)).maintain_aspect_ratio(true));
+                ui.with_layout(
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        if let Some(id) = self.egui_tex_id {
+                            let full = ui.available_size();
+                            let aspect = self.size.0 as f32 / self.size.1 as f32;
+                            let desired = full.x.min(full.y) * egui::vec2(1.0, aspect);
+                            ui.add(egui::Image::new((id, desired)).maintain_aspect_ratio(true));
 
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if matches!(self.gui.mode, GuiMode::Draw) {
-                            self.handle_drawing(ctx, device, ui, aspect);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if matches!(self.gui.mode, GuiMode::Draw) {
+                                self.handle_drawing(ctx, device, ui, aspect);
+                            }
+                        } else {
+                            ui.colored_label(Color32::LIGHT_RED, "Texture not ready");
                         }
-                    } else {
-                        ui.colored_label(Color32::LIGHT_RED, "Texture not ready");
-                    }
-                });
+                    },
+                );
             });
         #[cfg(not(target_arch = "wasm32"))]
         if matches!(self.gui.mode, GuiMode::Draw) {

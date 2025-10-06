@@ -142,7 +142,7 @@ impl GenerationSettings {
     pub fn default(id: Uuid, name: String) -> Self {
         Self {
             name,
-            proximity_importance: 10, // 20
+            proximity_importance: 13, // 20
             algorithm: Algorithm::Genetic,
             id,
             sidelen: 128,

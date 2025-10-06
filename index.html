@@ -10,18 +10,18 @@
     <title>obamify</title>
 
     <!-- config for our rust wasm binary. go to https://trunkrs.dev/assets/#rust for more customization -->
-    <link data-trunk rel="rust" data-wasm-opt="2" />
+    <link data-trunk rel="rust" data-wasm-opt="2" data-integrity="none"/>
     <!-- this is the base url relative to which other urls will be constructed. trunk will insert this from the public-url option -->
     <base data-trunk-public-url />
 
     <link data-trunk rel="icon" href="assets/favicon.ico">
 
-
-    <link data-trunk rel="copy-file" href="assets/sw.js"/>
     <link data-trunk rel="copy-file" href="assets/manifest.json"/>
     <link data-trunk rel="copy-file" href="assets/android-chrome-192x192.png" data-target-path="assets"/>
     <link data-trunk rel="copy-file" href="assets/android-chrome-512x512.png" data-target-path="assets"/>
     <link data-trunk rel="copy-file" href="assets/apple-touch-icon.png" data-target-path="assets"/>
+    <link data-trunk rel="copy-file" href="assets/pfp_transparent.png" data-target-path="assets"/>
+    <link data-trunk rel="copy-file" href="assets/github-mark-white.svg" data-target-path="assets"/>
     <link data-trunk rel="copy-file" href="worker.js"/>
 
 
@@ -133,6 +133,75 @@
                 transform: rotate(360deg);
             }
         }
+
+        /* Bottom-left corner icons */
+        .bottom-left-icons {
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 1000;
+        }
+
+        @media (orientation: portrait) {
+            .bottom-left-icons {
+            flex-direction: row;
+            }
+        }
+
+        .icon-link {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 64px;
+            height: 64px;
+            background-color: rgba(0, 0, 0, 1.0);
+            border-radius: 12px;
+            transition: all 0.2s ease;
+            text-decoration: none;
+            overflow: visible;
+        }
+
+        .icon-link:hover {
+            transform: scale(1.1);
+            background-color: rgba(0, 0, 0, 1.0);
+            border-radius: 12px 12px 0 12px;
+        }
+
+        .icon-link img {
+            width: 48px;
+            height: 48px;
+            border-radius: 6px;
+        }
+
+        .icon-text {
+            position: absolute;
+            left: 100%;
+            top: 50%;
+            background-color: rgba(0, 0, 0, 0.9);
+            color: white;
+            padding: 8px 12px;
+            padding-left: 8px;
+            border-radius: 0 8px 8px 0;
+            font-family: Fira Code, monospace, sans-serif;
+            font-size: 14px;
+            white-space: nowrap;
+            margin-left: 0px;
+            opacity: 0;
+            transform: translateY(0%) translateX(-10px);
+            transition: all 0.3s ease;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        .bottom-left-icons:hover .icon-text {
+            padding-left: 18px;
+            opacity: 1;
+            transform: translateY(0%) translateX(0);
+        }
     </style>
 </head>
 
@@ -150,16 +219,17 @@
         <div class="lds-dual-ring"></div>
     </div>
 
-    <!--Register Service Worker. this will cache the wasm / js scripts for offline use (for PWA functionality). -->
-    <!-- Force refresh (Ctrl + F5) to load the latest files instead of cached files  -->
-    <script>
-        // We disable caching during development so that we always view the latest version.
-        if ('serviceWorker' in navigator && window.location.hash !== "#dev") {
-            window.addEventListener('load', function () {
-                navigator.serviceWorker.register('sw.js');
-            });
-        }
-    </script>
+    <!-- Bottom-left corner icons -->
+    <div class="bottom-left-icons">
+        <a href="https://github.com/Spu7Nix/obamify" class="icon-link" target="_blank" rel="noopener noreferrer">
+            <img src="assets/github-mark-white.svg" alt="source code" />
+            <span class="icon-text">source code</span>
+        </a>
+        <a href="https://spu7nix.net" class="icon-link" target="_blank" rel="noopener noreferrer">
+            <img src="assets/pfp_transparent.png" alt="Spu7Nix" />
+            <span class="icon-text">my website</span>
+        </a>
+    </div>
 </body>
 
 </html>
