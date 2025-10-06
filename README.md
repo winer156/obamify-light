@@ -1,4 +1,4 @@
-[(try it here)](https://spu7nix.github.io/obamify/)
+[(try it here)](https://obamify.com/)
 # obamify
 revolutionary new technology that turns any image into obama
 
