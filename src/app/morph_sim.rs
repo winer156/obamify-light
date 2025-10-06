@@ -2,10 +2,10 @@ use std::mem;
 
 use image::ImageBuffer;
 
-use crate::app::{
-    SeedColor, SeedPos,
-    preset::{Preset, UnprocessedPreset},
-};
+use crate::app::{SeedColor, SeedPos, preset::Preset};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::preset::UnprocessedPreset;
 
 // const DST_FORCE: f32 = 0.2;
 pub fn init_image(sidelen: u32, source: Preset) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
@@ -28,6 +28,7 @@ pub fn init_image(sidelen: u32, source: Preset) -> (u32, Vec<SeedPos>, Vec<SeedC
     (seeds_n as u32, seeds, colors, sim)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn init_canvas(
     sidelen: u32,
     source: UnprocessedPreset,
@@ -121,15 +122,15 @@ impl CellBody {
             stroke_id: 0,
         }
     }
-
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_age(&mut self, age: u32) {
         self.age = age;
     }
-
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_dst_force(&mut self, force: f32) {
         self.dst_force = force;
     }
-
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_stroke_id(&mut self, stroke_id: u32) {
         self.stroke_id = stroke_id;
     }

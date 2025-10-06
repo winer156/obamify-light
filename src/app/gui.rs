@@ -1,11 +1,13 @@
+#[cfg(not(target_arch = "wasm32"))]
 use super::DRAWING_ALPHA;
 
 use super::GuiMode;
 use super::ObamifyApp;
 use crate::app::calculate;
-use crate::app::calculate::GenerationSettings;
 use crate::app::calculate::ProgressMsg;
-use crate::app::calculate::SourceImg;
+use crate::app::calculate::util::CropScale;
+use crate::app::calculate::util::GenerationSettings;
+use crate::app::calculate::util::SourceImg;
 use crate::app::gif_recorder::GIF_FRAMERATE;
 use crate::app::gif_recorder::GIF_NUM_FRAMES;
 use crate::app::gif_recorder::GIF_RESOLUTION;
@@ -14,10 +16,16 @@ use crate::app::preset::Preset;
 use crate::app::preset::UnprocessedPreset;
 use eframe::App;
 use eframe::Frame;
-use egui::Color32;
+use egui::ImageSource;
 use egui::Modal;
+use egui::TextureHandle;
 use egui::Window;
+use egui::{Color32, ColorImage};
+use egui_wgpu::Texture;
 use image::buffer::ConvertBuffer;
+use image::imageops;
+use palette::blend;
+use serde::de::value;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -26,8 +34,17 @@ use uuid::Uuid;
 // #[cfg(not(target_arch = "wasm32"))]
 // use std::thread as wasm_thread;
 
+#[derive(Default)]
+struct GuiImageCache {
+    source_preview: Option<egui::TextureHandle>,
+    target_preview: Option<egui::TextureHandle>,
+    overlap_preview: Option<egui::TextureHandle>,
+}
+
 pub(crate) struct GuiState {
+    #[cfg(not(target_arch = "wasm32"))]
     pub last_mouse_pos: Option<(f32, f32)>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub drawing_color: [f32; 4],
     pub mode: GuiMode,
     pub animate: bool,
@@ -38,7 +55,7 @@ pub(crate) struct GuiState {
     //pub currently_processing: Option<Preset>,
     pub presets: Vec<Preset>,
     //pub current_settings: GenerationSettings,
-    pub configuring_generation: Option<(SourceImg, GenerationSettings)>,
+    pub configuring_generation: Option<(SourceImg, GenerationSettings, GuiImageCache)>,
     pub current_preset: usize,
 }
 
@@ -52,7 +69,9 @@ impl GuiState {
             show_progress_modal: None,
             last_progress: 0.0,
             process_cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(not(target_arch = "wasm32"))]
             last_mouse_pos: None,
+            #[cfg(not(target_arch = "wasm32"))]
             drawing_color: [0.0, 0.0, 0.0, DRAWING_ALPHA],
             //currently_processing: None,
             //current_settings: GenerationSettings::default(),
@@ -234,10 +253,7 @@ impl App for ObamifyApp {
                                 self.change_sim(device, self.gui.presets[0].clone(), 0);
                             }
                         }
-                        #[cfg(target_arch = "wasm32")]
-                        GuiMode::Draw => {
-                            ui.label("drawing mode not available on the web version :(");
-                        }
+
                         GuiMode::Transform => {
                             ui.horizontal_wrapped(|ui| {
                                 if ui
@@ -392,71 +408,18 @@ impl App for ObamifyApp {
 
                                 if ui.button("obamify new image").clicked() {
                                     // open file select
-
-                                    #[cfg(target_arch = "wasm32")]
-                                    {
-                                        use wasm_bindgen_futures::spawn_local;
-                                        let app_ptr: *mut Self = self;
-
-                                        spawn_local(async move {
-                                            if let Some(handle) = rfd::AsyncFileDialog::new()
-                                            .set_title(
-                                                "choose image (square aspect ratio recommended)",
-                                            )
-                                            .add_filter(
-                                                "image files",
-                                                &["png", "jpg", "jpeg", "webp"],
-                                            )
-                                            .pick_file()
-                                            .await
-                                        {
-                                            let name = get_default_preset_name(handle.file_name());
-                                            let data = handle.read().await;
-                                            if let Ok(img) = image::load_from_memory(&data) {
-                                                // SAFETY: We ensure the app outlives the async task (eframe app is long-lived).
-                                                // We only mutate a simple field after the dialog completes.
-                                                unsafe {
-                                                    if let Some(app) = app_ptr.as_mut() {
-                                                        app.gui.configuring_generation = Some((
-                                                            img.to_rgb8(),
-                                                            GenerationSettings::default(
-                                                                Uuid::new_v4(),
-                                                                name,
-                                                            ),
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        });
-                                    }
-
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    {
-                                        if let Some(file) = rfd::FileDialog::new()
-                                            .set_title(
-                                                "choose image (square aspect ratio recommended)",
-                                            )
-                                            .add_filter(
-                                                "image files",
-                                                &["png", "jpg", "jpeg", "webp"],
-                                            )
-                                            .pick_file()
-                                        {
-                                            let name = get_default_preset_name(
-                                                file.file_name()
-                                                    .unwrap()
-                                                    .to_string_lossy()
-                                                    .to_string(),
-                                            );
-                                            self.gui.configuring_generation = Some((
-                                                image::open(file)
-                                                    .expect("failed to open image")
-                                                    .to_rgb8(),
+                                    prompt_image(
+                                        "choose image to obamify",
+                                        self,
+                                        |name: String, mut img: SourceImg, app: &mut ObamifyApp| {
+                                            img = ensure_reasonable_size(img);
+                                            app.gui.configuring_generation = Some((
+                                                img,
                                                 GenerationSettings::default(Uuid::new_v4(), name),
+                                                GuiImageCache::default(),
                                             ));
-                                        }
-                                    }
+                                        },
+                                    );
                                 }
                             });
                             ui.separator();
@@ -484,140 +447,238 @@ impl App for ObamifyApp {
                             }
 
                             if self.gui.configuring_generation.is_some() {
-                                Modal::new("configuring_generation".into()).show(ui.ctx(), |ui| {
-                                    ui.set_max_width((screen_width * 0.9).min(500.0));
-                                    ui.set_max_height(500.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("obamification settings")
-                                                .heading()
-                                                .strong(),
-                                        );
-                                        ui.separator();
-                                        ui.horizontal(|ui| {
-                                            ui.label("name:");
-                                            if let Some((_, settings)) =
-                                                self.gui.configuring_generation.as_mut()
-                                            {
-                                                ui.text_edit_singleline(&mut settings.name);
-                                            }
-                                        });
-
-                                        if let Some((_img, settings)) =
-                                            self.gui.configuring_generation.as_mut()
-                                        {
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(ui.available_width(), 0.0),
-                                                if !mobile_layout {
-                                                    egui::Layout::left_to_right(egui::Align::Center)
-                                                        .with_main_wrap(true)
-                                                } else {
-                                                    egui::Layout::top_down(egui::Align::Min)
-                                                },
-                                                |ui| {
-                                                    ui.label("proximity importance:");
-
-                                                    let slider_w = ui.available_width().min(260.0);
-                                                    ui.add_sized(
-                                                        [slider_w, 20.0],
-                                                        egui::Slider::new(
-                                                            &mut settings.proximity_importance,
-                                                            0..=50,
-                                                        ),
-                                                    );
-
-                                                    let mut algorithm = match settings.algorithm {
-                                                        calculate::Algorithm::Optimal => {
-                                                            "optimal algorithm"
-                                                        }
-                                                        calculate::Algorithm::Genetic => {
-                                                            "fast algorithm"
-                                                        }
-                                                    };
-
-                                                    egui::ComboBox::from_id_salt(
-                                                        "algorithm_select",
+                                Window::new("obamification settings")
+                                    .max_width(400.0)
+                                    .max_height(500.0)
+                                    //.scroll([false, true])
+                                    .collapsible(false)
+                                    .movable(false)
+                                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                    .show(ui.ctx(), |ui| {
+                                        // ui.set_width((screen_width * 0.9).min(400.0));
+                                        // ui.set_max_height(500.0);
+                                        let max_w = ui.available_width();
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(max_w, 0.0),
+                                            egui::Layout::top_down(egui::Align::Center),
+                                            |ui| {
+                                                ui.set_max_width(max_w);
+                                                // ui.add(egui::Label::new(
+                                                //     egui::RichText::new("obamification settings")
+                                                //         .heading()
+                                                //         .strong(),
+                                                // ));
+                                                // ui.separator();
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(max_w, 0.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
                                                     )
-                                                    .selected_text(algorithm)
-                                                    .show_ui(ui, |ui| {
-                                                        if ui.button("optimal algorithm").clicked()
+                                                    .with_main_wrap(true),
+                                                    |ui| {
+                                                        ui.label("name:");
+                                                        if let Some((_, settings, _)) =
+                                                            self.gui.configuring_generation.as_mut()
                                                         {
-                                                            algorithm = "optimal algorithm";
-                                                            settings.algorithm =
-                                                                calculate::Algorithm::Optimal;
+                                                            ui.text_edit_singleline(
+                                                                &mut settings.name,
+                                                            );
                                                         }
-                                                        if ui.button("fast algorithm").clicked() {
-                                                            algorithm = "fast algorithm";
-                                                            settings.algorithm =
-                                                                calculate::Algorithm::Genetic;
-                                                        }
-                                                    });
-                                                },
-                                            );
-                                        }
-                                        ui.separator();
-                                        ui.horizontal_wrapped(|ui| {
-                                            if ui
-                                                .add(egui::Button::new(
-                                                    egui::RichText::new("start!").strong(),
-                                                ))
-                                                .clicked()
-                                            {
-                                                if let Some((img, settings)) =
-                                                    self.gui.configuring_generation.take()
-                                                {
-                                                    self.gui.show_progress_modal =
-                                                        Some(settings.id);
-                                                    //self.gui.currently_processing = Some(path.clone());
-                                                    //self.change_sim(device, path.clone(), false);
+                                                    },
+                                                );
 
-                                                    self.gui.process_cancelled.store(
-                                                        false,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    );
+                                                ui.separator();
 
-                                                    let unprocessed = UnprocessedPreset {
-                                                        name: settings.name.clone(),
-                                                        width: img.width(),
-                                                        height: img.height(),
-                                                        source_img: img.into_raw(),
-                                                    };
+                                                ui.allocate_ui_with_layout(
+                                                    egui::vec2(max_w, 0.0),
+                                                    egui::Layout::left_to_right(
+                                                        egui::Align::Center,
+                                                    )
+                                                    .with_main_wrap(true)
+                                                    .with_main_justify(true),
+                                                    |ui| {
+                                                        ui.set_max_width(max_w);
+                                                        if let Some((source_img, settings, cache)) =
+                                                            self.gui.configuring_generation.as_mut()
+                                                        {
+                                                            image_crop_gui(
+                                                                "source image",
+                                                                ui,
+                                                                source_img,
+                                                                &mut settings.source_crop_scale,
+                                                                settings.sidelen,
+                                                                &mut cache.source_preview,
+                                                            );
 
-                                                    #[cfg(target_arch = "wasm32")]
-                                                    {
-                                                        self.start_job(unprocessed, settings);
-                                                    }
-
-                                                    #[cfg(not(target_arch = "wasm32"))]
-                                                    {
-                                                        std::thread::spawn({
-                                                            let tx = self.progress_tx.clone();
-                                                            let cancelled =
-                                                                self.gui.process_cancelled.clone();
-                                                            move || {
-                                                                let result = calculate::process(
-                                                                    unprocessed,
+                                                            // ./arrow-right.svg
+                                                            ui.vertical(|ui| {
+                                                                image_overlap_preview(
+                                                                    "overlap preview",
+                                                                    ui,
                                                                     settings,
-                                                                    &mut tx.clone(),
-                                                                    cancelled,
+                                                                    cache,
+                                                                    source_img,
+                                                                    &settings.get_raw_target(),
+                                                                    0.5,
                                                                 );
-                                                                if let Err(err) = result {
-                                                                    tx.send(ProgressMsg::Error(
-                                                                        err.to_string(),
-                                                                    ))
-                                                                    .ok();
-                                                                }
+                                                                ui.add(
+                                                                    egui::Image::new(
+                                                                        egui::include_image!(
+                                                                            "./arrow-right.svg"
+                                                                        ),
+                                                                    )
+                                                                    .max_size(egui::vec2(
+                                                                        50.0, 50.0,
+                                                                    )),
+                                                                );
+                                                            });
+
+                                                            image_crop_gui(
+                                                                "target image",
+                                                                ui,
+                                                                &settings.get_raw_target(),
+                                                                &mut settings.target_crop_scale,
+                                                                settings.sidelen,
+                                                                &mut cache.target_preview,
+                                                            );
+                                                        }
+                                                    },
+                                                );
+
+                                                ui.separator();
+
+                                                if let Some((_img, settings, _)) =
+                                                    self.gui.configuring_generation.as_mut()
+                                                {
+                                                    ui.allocate_ui_with_layout(
+                                                    egui::vec2(max_w, 0.0),
+                                                    if !mobile_layout {
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Center,
+                                                        )
+                                                        .with_main_wrap(true)
+                                                    } else {
+                                                        egui::Layout::top_down(egui::Align::Min)
+                                                    },
+                                                    |ui| {
+                                                        ui.label("proximity importance:");
+
+                                                        let slider_w =
+                                                            ui.available_width().min(260.0);
+                                                        ui.add_sized(
+                                                            [slider_w, 20.0],
+                                                            egui::Slider::new(
+                                                                &mut settings.proximity_importance,
+                                                                0..=50,
+                                                            ),
+                                                        );
+
+                                                        let mut algorithm = match settings.algorithm
+                                                        {
+                                                            calculate::util::Algorithm::Optimal => {
+                                                                "optimal algorithm"
+                                                            }
+                                                            calculate::util::Algorithm::Genetic => {
+                                                                "fast algorithm"
+                                                            }
+                                                        };
+
+                                                        egui::ComboBox::from_id_salt(
+                                                            "algorithm_select",
+                                                        )
+                                                        .selected_text(algorithm)
+                                                        .show_ui(ui, |ui| {
+                                                            if ui
+                                                                .button("optimal algorithm")
+                                                                .clicked()
+                                                            {
+                                                                algorithm = "optimal algorithm";
+                                                                settings.algorithm =
+                                                                calculate::util::Algorithm::Optimal;
+                                                            }
+                                                            if ui.button("fast algorithm").clicked()
+                                                            {
+                                                                algorithm = "fast algorithm";
+                                                                settings.algorithm =
+                                                                calculate::util::Algorithm::Genetic;
                                                             }
                                                         });
-                                                    }
+                                                    },
+                                                );
                                                 }
-                                            }
-                                            if ui.button("cancel").clicked() {
-                                                self.gui.configuring_generation = None;
-                                            }
-                                        });
+                                                ui.separator();
+                                                ui.horizontal_wrapped(|ui| {
+                                                    if ui
+                                                        .add(egui::Button::new(
+                                                            egui::RichText::new("start!").strong(),
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        if let Some((img, settings, _)) =
+                                                            self.gui.configuring_generation.take()
+                                                        {
+                                                            self.gui.show_progress_modal =
+                                                                Some(settings.id);
+                                                            //self.gui.currently_processing = Some(path.clone());
+                                                            //self.change_sim(device, path.clone(), false);
+
+                                                            self.gui.process_cancelled.store(
+                                                            false,
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+
+                                                            let unprocessed = UnprocessedPreset {
+                                                                name: settings.name.clone(),
+                                                                width: img.width(),
+                                                                height: img.height(),
+                                                                source_img: img.into_raw(),
+                                                            };
+
+                                                            #[cfg(target_arch = "wasm32")]
+                                                            {
+                                                                self.start_job(
+                                                                    unprocessed,
+                                                                    settings,
+                                                                );
+                                                            }
+
+                                                            #[cfg(not(target_arch = "wasm32"))]
+                                                            {
+                                                                std::thread::spawn({
+                                                                    let tx =
+                                                                        self.progress_tx.clone();
+                                                                    let cancelled = self
+                                                                        .gui
+                                                                        .process_cancelled
+                                                                        .clone();
+                                                                    move || {
+                                                                        let result =
+                                                                            calculate::process(
+                                                                                unprocessed,
+                                                                                settings,
+                                                                                &mut tx.clone(),
+                                                                                cancelled,
+                                                                            );
+                                                                        if let Err(err) = result {
+                                                                            tx.send(
+                                                                                ProgressMsg::Error(
+                                                                                    err.to_string(),
+                                                                                ),
+                                                                            )
+                                                                            .ok();
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    if ui.button("cancel").clicked() {
+                                                        self.gui.configuring_generation = None;
+                                                    }
+                                                });
+                                            },
+                                        );
                                     });
-                                });
                             }
 
                             if let Some(progress_id) = self.gui.show_progress_modal {
@@ -772,6 +833,7 @@ impl App for ObamifyApp {
                         let desired = full.x.min(full.y) * egui::vec2(1.0, aspect);
                         ui.add(egui::Image::new((id, desired)).maintain_aspect_ratio(true));
 
+                        #[cfg(not(target_arch = "wasm32"))]
                         if matches!(self.gui.mode, GuiMode::Draw) {
                             self.handle_drawing(ctx, device, ui, aspect);
                         }
@@ -780,6 +842,7 @@ impl App for ObamifyApp {
                     }
                 });
             });
+        #[cfg(not(target_arch = "wasm32"))]
         if matches!(self.gui.mode, GuiMode::Draw) {
             let number_keys = [
                 egui::Key::Num1,
@@ -951,6 +1014,152 @@ impl App for ObamifyApp {
     }
 }
 
+fn prompt_image(
+    title: &'static str,
+    app: &mut ObamifyApp,
+    callback: impl FnOnce(String, image::RgbImage, &mut ObamifyApp) + 'static,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen_futures::spawn_local;
+        let app_ptr: *mut ObamifyApp = app;
+
+        spawn_local(async move {
+            if let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_title(title)
+                .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+                .await
+            {
+                let name = get_default_preset_name(handle.file_name());
+                let data = handle.read().await;
+                if let Ok(img) = image::load_from_memory(&data) {
+                    // SAFETY: We ensure the app outlives the async task (eframe app is long-lived).
+                    // We only mutate a simple field after the dialog completes.
+                    unsafe {
+                        if let Some(app) = app_ptr.as_mut() {
+                            callback(name, img.to_rgb8(), app)
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(file) = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
+            .pick_file()
+        {
+            let name =
+                get_default_preset_name(file.file_name().unwrap().to_string_lossy().to_string());
+            callback(
+                name,
+                image::open(file).expect("failed to open image").to_rgb8(),
+                app,
+            );
+        }
+    }
+}
+
+fn ensure_reasonable_size(img: SourceImg) -> SourceImg {
+    let max_side = 512;
+    let (w, h) = img.dimensions();
+    if w <= max_side && h <= max_side {
+        return img;
+    }
+    let scale = (max_side as f32 / w as f32).min(max_side as f32 / h as f32);
+    let new_w = (w as f32 * scale).round() as u32;
+    let new_h = (h as f32 * scale).round() as u32;
+
+    image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3)
+}
+
+fn image_overlap_preview(
+    arg: &str,
+    ui: &mut egui::Ui,
+    settings: &GenerationSettings,
+    cache: &mut GuiImageCache,
+    source_img: &SourceImg,
+    get_raw_target: &SourceImg,
+    blend: f32,
+) {
+    let tex = if cache.overlap_preview.is_none()
+        || cache.source_preview.is_none()
+        || cache.target_preview.is_none()
+    {
+        let src_img = settings.source_crop_scale.apply(source_img, 64);
+        let tgt_img = settings.target_crop_scale.apply(get_raw_target, 64);
+        let blended = blend_rgb_images(&src_img, &tgt_img, blend);
+        let p = ui.ctx().load_texture(
+            arg,
+            egui::ColorImage::from_rgb([64, 64], blended.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        cache.overlap_preview = Some(p.clone());
+        p
+    } else {
+        cache.overlap_preview.as_ref().unwrap().clone()
+    };
+    ui.add(egui::Image::from_texture(&tex));
+}
+
+fn image_crop_gui(
+    name: &'static str,
+    ui: &mut egui::Ui,
+    img: &SourceImg,
+    crop_scale: &mut CropScale,
+    sidelen: u32,
+    cache: &mut Option<TextureHandle>,
+) {
+    ui.vertical(|ui| {
+        let tex = match &cache {
+            None => {
+                let p = ui.ctx().load_texture(
+                    name,
+                    egui::ColorImage::from_rgb([128, 128], crop_scale.apply(img, sidelen).as_raw()),
+                    egui::TextureOptions::LINEAR,
+                );
+                *cache = Some(p.clone());
+                p
+            }
+            Some(t) => t.clone(),
+        };
+        ui.add(egui::Image::from_texture(&tex));
+
+        // crop sliders
+        ui.vertical(|ui| {
+            let values = *crop_scale;
+            let slider_w = ui.available_width().min(260.0);
+
+            ui.add_sized(
+                [slider_w, 20.0],
+                egui::Slider::new(&mut crop_scale.scale, 1.0..=5.0)
+                    .show_value(false)
+                    .text("zoom"),
+            );
+            ui.add_sized(
+                [slider_w, 20.0],
+                egui::Slider::new(&mut crop_scale.x, -1.0..=1.0)
+                    .show_value(false)
+                    .text("x-off."),
+            );
+            ui.add_sized(
+                [slider_w, 20.0],
+                egui::Slider::new(&mut crop_scale.y, -1.0..=1.0)
+                    .show_value(false)
+                    .text("y-off."),
+            );
+
+            if values != *crop_scale {
+                *cache = None; // force reload
+            }
+        });
+    });
+}
+
 fn get_default_preset_name(mut n: String) -> String {
     let mut name = {
         if let Some(dot) = n.rfind('.') {
@@ -968,4 +1177,72 @@ fn get_default_preset_name(mut n: String) -> String {
         name = name.chars().take(20).collect();
     }
     name
+}
+
+// fn blend_rgb_images(a: &image::RgbImage, b: &image::RgbImage, alpha: f32) -> image::RgbImage {
+//     assert_eq!(
+//         a.dimensions(),
+//         b.dimensions(),
+//         "Images must have same dimensions"
+//     );
+//     let (w, h) = a.dimensions();
+//     let alpha = alpha.clamp(0.0, 1.0);
+//     let inv = 1.0 - alpha;
+//     let mut out = image::RgbImage::new(w, h);
+//     for y in 0..h {
+//         for x in 0..w {
+//             let pa = a.get_pixel(x, y);
+//             let pb = b.get_pixel(x, y);
+//             let r = (pa[0] as f32 * inv + pb[0] as f32 * alpha).round() as u8;
+//             let g = (pa[1] as f32 * inv + pb[1] as f32 * alpha).round() as u8;
+//             let bch = (pa[2] as f32 * inv + pb[2] as f32 * alpha).round() as u8;
+//             out.put_pixel(x, y, image::Rgb([r, g, bch]));
+//         }
+//     }
+//     out
+// }
+
+pub fn blend_rgb_images(a: &SourceImg, b: &SourceImg, alpha: f32) -> SourceImg {
+    assert_eq!(
+        a.dimensions(),
+        b.dimensions(),
+        "Images must have same dimensions"
+    );
+
+    let (w, h) = a.dimensions();
+    let k = alpha.clamp(0.0, 1.0);
+    let sigma = 1.5;
+    let a_blur = imageops::blur(a, sigma);
+    let b_blur = imageops::blur(b, sigma);
+
+    let mut out = SourceImg::new(w, h);
+
+    for y in 0..h {
+        for x in 0..w {
+            let pa = a.get_pixel(x, y);
+            let pb = b.get_pixel(x, y);
+            let ga = a_blur.get_pixel(x, y);
+            let gb = b_blur.get_pixel(x, y);
+
+            let l0 = 0.5 * (ga[0] as f32 + gb[0] as f32);
+            let l1 = 0.5 * (ga[1] as f32 + gb[1] as f32);
+            let l2 = 0.5 * (ga[2] as f32 + gb[2] as f32);
+
+            let ha0 = pa[0] as f32 - ga[0] as f32;
+            let ha1 = pa[1] as f32 - ga[1] as f32;
+            let ha2 = pa[2] as f32 - ga[2] as f32;
+
+            let hb0 = pb[0] as f32 - gb[0] as f32;
+            let hb1 = pb[1] as f32 - gb[1] as f32;
+            let hb2 = pb[2] as f32 - gb[2] as f32;
+
+            let r0 = (l0 + k * (ha0 + hb0)).clamp(0.0, 255.0).round() as u8;
+            let r1 = (l1 + k * (ha1 + hb1)).clamp(0.0, 255.0).round() as u8;
+            let r2 = (l2 + k * (ha2 + hb2)).clamp(0.0, 255.0).round() as u8;
+
+            out.put_pixel(x, y, image::Rgb([r0, r1, r2]));
+        }
+    }
+
+    out
 }

@@ -11,12 +11,16 @@ pub use crate::app::calculate::worker::worker_entry;
 use std::sync::mpsc;
 use std::{
     num::NonZeroU64,
-    sync::{Arc, RwLock, atomic::AtomicU32},
+    sync::{Arc, RwLock},
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicU32;
 
 use bytemuck::{Pod, Zeroable};
 use eframe::CreationContext;
 use egui_wgpu::{self, wgpu};
+#[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 
@@ -61,14 +65,12 @@ const DEFAULT_RESOLUTION: u32 = 1024;
 
 pub enum GuiMode {
     Transform,
+    #[cfg(not(target_arch = "wasm32"))]
     Draw,
 }
 
 use crate::app::{calculate::ProgressMsg, morph_sim::Sim, preset::UnprocessedPreset};
-use crate::app::{
-    calculate::{GenerationSettings, drawing_process::PixelData},
-    preset::Preset,
-};
+use crate::app::{calculate::util::GenerationSettings, preset::Preset};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::closure::Closure;
@@ -100,7 +102,9 @@ pub struct ObamifyApp {
     // Seeds CPU copy
     seeds: Vec<SeedPos>,
     colors: Arc<RwLock<Vec<SeedColor>>>,
-    pixeldata: Arc<RwLock<Vec<PixelData>>>,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pixeldata: Arc<RwLock<Vec<calculate::drawing_process::PixelData>>>,
 
     // EGUI texture id for presenting the shaded RGBA texture
     egui_tex_id: Option<egui::TextureId>,
@@ -142,12 +146,13 @@ pub struct ObamifyApp {
     jfa_bg_b_to_a: wgpu::BindGroup,
     shade_bg: wgpu::BindGroup,
     preview_image: Option<image::ImageBuffer<image::Rgb<u8>, Vec<u8>>>,
-
+    #[cfg(not(target_arch = "wasm32"))]
     stroke_count: u32,
 
     frame_count: u32,
 
     gui: gui::GuiState,
+    #[cfg(not(target_arch = "wasm32"))]
     current_drawing_id: Arc<AtomicU32>,
 }
 
@@ -190,7 +195,11 @@ impl ObamifyApp {
         });
 
         *self.colors.write().unwrap() = colors;
-        *self.pixeldata.write().unwrap() = PixelData::init_canvas(self.frame_count);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *self.pixeldata.write().unwrap() =
+                calculate::drawing_process::PixelData::init_canvas(self.frame_count);
+        }
 
         self.rebuild_bind_groups(device);
     }
@@ -201,6 +210,7 @@ impl ObamifyApp {
         self.gui.current_preset = change_index;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn canvas_sim(&mut self, device: &wgpu::Device, source: &UnprocessedPreset) {
         let (seed_count, seeds, colors, sim) = morph_sim::init_canvas(self.size.0, source.clone());
         self.apply_sim_init(device, seed_count, seeds, colors, sim);
@@ -243,6 +253,7 @@ impl ObamifyApp {
         // seeds.push(SeedPos {
         //     xy: [size.1 as f32 * 0.45, size.1 as f32 * 0.45],
         // });
+        egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // get all folders in ../presets
         let presets: Vec<Preset> = if let Some(storage) = cc.storage {
@@ -656,7 +667,10 @@ impl ObamifyApp {
 
             seeds,
             colors: Arc::new(RwLock::new(colors)),
-            pixeldata: Arc::new(RwLock::new(PixelData::init_canvas(0))),
+            #[cfg(not(target_arch = "wasm32"))]
+            pixeldata: Arc::new(RwLock::new(
+                calculate::drawing_process::PixelData::init_canvas(0),
+            )),
             egui_tex_id: None,
             seed_buf,
             color_buf,
@@ -690,10 +704,11 @@ impl ObamifyApp {
             progress_rx,
             gif_recorder: gif_recorder::GifRecorder::new(),
             preview_image: None,
-
+            #[cfg(not(target_arch = "wasm32"))]
             stroke_count: 0,
             gui: gui::GuiState::default(presets, random_preset),
             frame_count: 0,
+            #[cfg(not(target_arch = "wasm32"))]
             current_drawing_id: Arc::new(AtomicU32::new(0)),
             #[cfg(target_arch = "wasm32")]
             worker: None,
@@ -721,7 +736,7 @@ impl ObamifyApp {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn ensure_worker(&mut self, ctx: &egui::Context) {
+    fn ensure_worker(&mut self, _ctx: &egui::Context) {
         if self.worker.is_some() {
             return;
         }
@@ -1216,6 +1231,7 @@ impl ObamifyApp {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn draw(
         &mut self,
         last_mouse_pos: Option<(f32, f32)>,
@@ -1265,7 +1281,7 @@ impl ObamifyApp {
                 self.sim.cells[i].set_age(0);
                 self.sim.cells[i].set_dst_force(0.05 + (stroke_id as f32 * 0.004).sqrt());
                 self.sim.cells[i].set_stroke_id(stroke_id);
-                self.pixeldata.write().unwrap()[i] = PixelData {
+                self.pixeldata.write().unwrap()[i] = calculate::drawing_process::PixelData {
                     stroke_id,
                     last_edited: self.frame_count,
                 };
@@ -1281,6 +1297,7 @@ impl ObamifyApp {
         });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn handle_drawing(
         &mut self,
         ctx: &egui::Context,
@@ -1368,7 +1385,9 @@ impl ObamifyApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const DRAWING_ALPHA: f32 = 0.5;
+#[cfg(not(target_arch = "wasm32"))]
 fn point_to_line_dist(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     let dx = x1 - x0;
     let dy = y1 - y0;

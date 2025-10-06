@@ -1,11 +1,11 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, atomic::AtomicBool};
-
+#[cfg(not(target_arch = "wasm32"))]
 pub mod drawing_process;
 pub mod util;
+
 #[cfg(target_arch = "wasm32")]
 pub mod worker;
-#[cfg(target_arch = "wasm32")]
-use eframe::web;
 
 fn _debug_print(s: String) {
     #[cfg(target_arch = "wasm32")]
@@ -14,69 +14,14 @@ fn _debug_print(s: String) {
     println!("{}", s);
 }
 
+use crate::app::calculate::util::Algorithm;
+use crate::app::{
+    calculate::util::{GenerationSettings, ProgressSink, SourceImg},
+    preset::{Preset, UnprocessedPreset},
+};
 use egui::ahash::AHasher;
-use image::{GenericImageView, ImageBuffer};
 use pathfinding::prelude::Weights;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use crate::app::preset::{Preset, UnprocessedPreset};
-
-pub trait ProgressSink {
-    fn send(&mut self, msg: ProgressMsg);
-}
-// Native-friendly adapter
-impl ProgressSink for std::sync::mpsc::SyncSender<ProgressMsg> {
-    fn send(&mut self, msg: ProgressMsg) {
-        let _ = std::sync::mpsc::SyncSender::send(self, msg);
-    }
-}
-
-// Allow using closures as progress sinks in WASM
-impl<T> ProgressSink for T
-where
-    T: FnMut(crate::app::calculate::ProgressMsg),
-{
-    fn send(&mut self, msg: crate::app::calculate::ProgressMsg) {
-        self(msg);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub enum Algorithm {
-    Optimal,
-    Genetic,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct GenerationSettings {
-    pub name: String,
-    pub proximity_importance: i64,
-    pub algorithm: Algorithm,
-    pub rescale: Option<u32>,
-    pub id: Uuid,
-}
-
-pub type SourceImg = ImageBuffer<image::Rgb<u8>, Vec<u8>>;
-
-impl GenerationSettings {
-    pub fn default(id: Uuid, name: String) -> Self {
-        Self {
-            name,
-            proximity_importance: 10, // 20
-            algorithm: Algorithm::Genetic,
-            rescale: None,
-            id,
-        }
-    }
-
-    // pub fn quick_process() -> Self {
-    //     Self {
-    //         proximity_importance: 10,
-    //         rescale: Some(64),
-    //     }
-    // }
-}
 
 #[inline(always)]
 fn heuristic(
@@ -94,18 +39,18 @@ fn heuristic(
     color * color_weight + (spatial * spatial_weight).pow(2)
 }
 
-struct ImgDiffWeights {
+struct ImgDiffWeights<'a> {
     source: Vec<(u8, u8, u8)>,
     target: Vec<(u8, u8, u8)>,
     weights: Vec<i64>,
     sidelen: usize,
-    settings: GenerationSettings,
+    settings: &'a GenerationSettings,
 }
 
 // const TARGET_IMAGE_PATH: &str = "./target.png";
 // const TARGET_WEIGHTS_PATH: &str = "./weights.png";
 
-impl Weights<i64> for ImgDiffWeights {
+impl Weights<i64> for ImgDiffWeights<'_> {
     fn rows(&self) -> usize {
         self.target.len()
     }
@@ -178,15 +123,14 @@ pub fn process_optimal<S: ProgressSink>(
     )
     .unwrap();
     // let start_time = std::time::Instant::now();
-    let (target, source, source_pixels, target_pixels, weights) =
-        util::get_images(source_img, &settings)?;
+    let (source_pixels, target_pixels, weights) = util::get_images(source_img, &settings)?;
 
     let weights = ImgDiffWeights {
         source: source_pixels.clone(),
         target: target_pixels,
         weights,
-        sidelen: target.width() as usize,
-        settings,
+        sidelen: settings.sidelen as usize,
+        settings: &settings,
     };
 
     // pathfinding::kuhn_munkres, inlined to allow for progress bar and cancelling
@@ -310,7 +254,7 @@ pub fn process_optimal<S: ProgressSink>(
                         .into_iter()
                         .map(|a| a.unwrap_or(0))
                         .collect::<Vec<_>>(),
-                    target.width(),
+                    settings.sidelen,
                 );
 
                 tx.send(ProgressMsg::UpdatePreview {
@@ -333,9 +277,12 @@ pub fn process_optimal<S: ProgressSink>(
     tx.send(ProgressMsg::Done(Preset {
         inner: UnprocessedPreset {
             name: unprocessed.name,
-            width: source.width(),
-            height: source.height(),
-            source_img: source.into_raw(),
+            width: settings.sidelen,
+            height: settings.sidelen,
+            source_img: source_pixels
+                .into_iter()
+                .flat_map(|(r, g, b)| [r, g, b])
+                .collect(),
         },
         assignments: assignments.clone(),
     }));
@@ -403,10 +350,10 @@ impl Pixel {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-const SWAPS_PER_GENERATION: usize = 200000;
+const SWAPS_PER_GENERATION_PER_PIXEL: usize = 20;
 
 #[cfg(target_arch = "wasm32")]
-const SWAPS_PER_GENERATION: usize = 500000; // for some reason wasm is like 5x faster
+const SWAPS_PER_GENERATION_PER_PIXEL: usize = 100; // for some reason wasm is like 5x faster
 
 pub fn process_genetic<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
@@ -421,15 +368,14 @@ pub fn process_genetic<S: ProgressSink>(
     )
     .unwrap();
     // let start_time = std::time::Instant::now();
-    let (target, source, source_pixels, target_pixels, weights) =
-        util::get_images(source_img, &settings)?;
+    let (source_pixels, target_pixels, weights) = util::get_images(source_img, &settings)?;
 
     let mut pixels = source_pixels
         .iter()
         .enumerate()
         .map(|(i, &(r, g, b))| {
-            let x = (i as u32 % target.width()) as u16;
-            let y = (i as u32 / target.width()) as u16;
+            let x = (i as u32 % settings.sidelen) as u16;
+            let y = (i as u32 / settings.sidelen) as u16;
             let mut p = Pixel::new(x, y, (r, g, b), 0);
             let h = p.calc_heuristic(
                 (x, y),
@@ -443,19 +389,20 @@ pub fn process_genetic<S: ProgressSink>(
         .collect::<Vec<_>>();
 
     let mut rng = frand::Rand::with_seed(12345);
+    let swaps_per_generation = SWAPS_PER_GENERATION_PER_PIXEL * pixels.len();
 
-    let mut max_dist = target.width();
+    let mut max_dist = settings.sidelen;
     loop {
         let mut swaps_made = 0;
-        for _ in 0..SWAPS_PER_GENERATION {
+        for _ in 0..swaps_per_generation {
             let apos = rng.gen_range(0..pixels.len() as u32) as usize;
-            let ax = apos as u16 % target.width() as u16;
-            let ay = apos as u16 / target.width() as u16;
+            let ax = apos as u16 % settings.sidelen as u16;
+            let ay = apos as u16 / settings.sidelen as u16;
             let bx = (ax as i16 + rng.gen_range(-(max_dist as i16)..(max_dist as i16 + 1)))
-                .clamp(0, target.width() as i16 - 1) as u16;
+                .clamp(0, settings.sidelen as i16 - 1) as u16;
             let by = (ay as i16 + rng.gen_range(-(max_dist as i16)..(max_dist as i16 + 1)))
-                .clamp(0, target.width() as i16 - 1) as u16;
-            let bpos = by as usize * target.width() as usize + bx as usize;
+                .clamp(0, settings.sidelen as i16 - 1) as u16;
+            let bpos = by as usize * settings.sidelen as usize + bx as usize;
 
             let t_a = target_pixels[apos];
             let t_b = target_pixels[bpos];
@@ -496,7 +443,7 @@ pub fn process_genetic<S: ProgressSink>(
 
         let assignments = pixels
             .iter()
-            .map(|p| p.src_y as usize * target.width() as usize + p.src_x as usize)
+            .map(|p| p.src_y as usize * settings.sidelen as usize + p.src_x as usize)
             .collect::<Vec<_>>();
         //debug_print(format!("max_dist = {max_dist}, swaps made = {swaps_made}"));
         if max_dist < 4 && swaps_made < 10 {
@@ -504,36 +451,29 @@ pub fn process_genetic<S: ProgressSink>(
             tx.send(ProgressMsg::Done(Preset {
                 inner: UnprocessedPreset {
                     name: unprocessed.name,
-                    width: source.width(),
-                    height: source.height(),
-                    source_img: source.into_raw(),
+                    width: settings.sidelen,
+                    height: settings.sidelen,
+                    source_img: source_pixels
+                        .iter()
+                        .flat_map(|(r, g, b)| [*r, *g, *b])
+                        .collect(),
                 },
                 assignments: assignments.clone(),
             }));
             return Ok(());
         }
-        let img = make_new_img(&source_pixels, &assignments, target.width());
+        let img = make_new_img(&source_pixels, &assignments, settings.sidelen);
         tx.send(ProgressMsg::UpdatePreview {
             width: img.width(),
             height: img.height(),
             data: img.into_raw(),
         });
         tx.send(ProgressMsg::Progress(
-            1.0 - max_dist as f32 / target.width() as f32,
+            1.0 - max_dist as f32 / settings.sidelen as f32,
         ));
 
         max_dist = (max_dist as f32 * 0.99).max(2.0) as u32;
     }
-}
-
-fn load_weights(source: &image::DynamicImage) -> Vec<i64> {
-    let (width, height) = source.dimensions();
-    let mut weights = vec![0; (width * height) as usize];
-    for (x, y, pixel) in source.pixels() {
-        let weight = pixel[0] as i64;
-        weights[(y * width + x) as usize] = weight;
-    }
-    weights
 }
 
 // fn serialize_assignments(assignments: Vec<usize>) -> String {

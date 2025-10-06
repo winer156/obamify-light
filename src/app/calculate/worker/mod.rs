@@ -1,5 +1,4 @@
 use eframe::wasm_bindgen::prelude::*;
-use eframe::web;
 use serde::{Deserialize, Serialize};
 use web_sys::DedicatedWorkerGlobalScope;
 use web_sys::js_sys;

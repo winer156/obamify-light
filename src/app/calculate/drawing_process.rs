@@ -1,8 +1,7 @@
 use crate::app::SeedColor;
 use crate::app::calculate;
+use crate::app::calculate::SWAPS_PER_GENERATION_PER_PIXEL;
 use crate::app::preset::UnprocessedPreset;
-
-use super::SWAPS_PER_GENERATION;
 
 use std::error::Error;
 
@@ -139,7 +138,7 @@ pub fn drawing_process_genetic(
     let source_img =
         image::ImageBuffer::from_raw(source.width, source.height, source.source_img.clone())
             .unwrap();
-    let (target, source, source_pixels, target_pixels, weights) =
+    let (source_pixels, target_pixels, weights) =
         calculate::util::get_images(source_img, &settings)?;
 
     let mut pixels = {
@@ -150,8 +149,8 @@ pub fn drawing_process_genetic(
             .iter()
             .enumerate()
             .map(|(i, _)| {
-                let x = (i as u32 % source.width()) as u16;
-                let y = (i as u32 / source.width()) as u16;
+                let x = (i as u32 % settings.sidelen) as u16;
+                let y = (i as u32 / settings.sidelen) as u16;
                 let mut p = DrawingPixel::new(x, y, 0);
                 let h = p.calc_drawing_heuristic(
                     (x, y),
@@ -172,6 +171,8 @@ pub fn drawing_process_genetic(
         (((DRAWING_CANVAS_SIZE / 4) as f32) * (0.99f32).powi(age as i32 / 30)).round() as u32
     }
 
+    let swaps_per_generation = SWAPS_PER_GENERATION_PER_PIXEL * pixels.len();
+
     loop {
         let colors: Vec<SeedColor> = {
             let r = colors.read().unwrap();
@@ -183,19 +184,19 @@ pub fn drawing_process_genetic(
         };
         let mut swaps_made = 0;
 
-        for _ in 0..SWAPS_PER_GENERATION {
+        for _ in 0..swaps_per_generation {
             let apos = rng.gen_range(0..pixels.len() as u64) as usize;
-            let ax = apos as u16 % target.width() as u16;
-            let ay = apos as u16 / target.width() as u16;
+            let ax = apos as u16 % settings.sidelen as u16;
+            let ay = apos as u16 / settings.sidelen as u16;
 
             //let stroke_id = pixel_data[apos].stroke_id as usize;
             let max_dist_a = max_dist(frame_count.saturating_sub(pixel_data[apos].last_edited));
 
             let bx = (ax as i16 + rng.gen_range(-(max_dist_a as i16)..(max_dist_a as i16 + 1)))
-                .clamp(0, target.width() as i16 - 1) as u16;
+                .clamp(0, settings.sidelen as i16 - 1) as u16;
             let by = (ay as i16 + rng.gen_range(-(max_dist_a as i16)..(max_dist_a as i16 + 1)))
-                .clamp(0, target.width() as i16 - 1) as u16;
-            let bpos = by as usize * target.width() as usize + bx as usize;
+                .clamp(0, settings.sidelen as i16 - 1) as u16;
+            let bpos = by as usize * settings.sidelen as usize + bx as usize;
 
             let max_dist_b = max_dist(frame_count.saturating_sub(pixel_data[bpos].last_edited));
             if (bx as i32 - ax as i32).abs() > max_dist_b as i32
@@ -249,7 +250,7 @@ pub fn drawing_process_genetic(
         if swaps_made > 0 {
             let assignments = pixels
                 .iter()
-                .map(|p| p.src_y as usize * source.width() as usize + p.src_x as usize)
+                .map(|p| p.src_y as usize * settings.sidelen as usize + p.src_x as usize)
                 .collect::<Vec<_>>();
             tx.send(ProgressMsg::UpdateAssignments(assignments))?;
         }

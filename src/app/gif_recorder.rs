@@ -1,5 +1,3 @@
-#[cfg(target_arch = "wasm32")]
-use std::cell::Cell;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
