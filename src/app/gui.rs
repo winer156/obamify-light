@@ -75,6 +75,40 @@ impl GuiState {
             current_preset,
         }
     }
+
+    fn show_progress_modal(&mut self, id: Uuid) {
+        self.show_progress_modal = Some(id);
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsCast;
+            // hide .bottom-left-icons class while processing
+            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
+                    web_sys::console::log_1(&"hiding icons".into());
+                    let _ = icons
+                        .dyn_ref::<web_sys::HtmlElement>()
+                        .map(|e| e.style().set_property("display", "none"));
+                }
+            }
+        }
+    }
+
+    fn hide_progress_modal(&mut self) {
+        self.show_progress_modal = None;
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsCast;
+            // show .bottom-left-icons class after processing
+            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
+                    web_sys::console::log_1(&"showing icons".into());
+                    let _ = icons
+                        .dyn_ref::<web_sys::HtmlElement>()
+                        .map(|e| e.style().set_property("display", "flex"));
+                }
+            }
+        }
+    }
 }
 
 impl App for ObamifyApp {
@@ -635,7 +669,7 @@ impl App for ObamifyApp {
                                     if let Some((img, settings, _)) =
                                         self.gui.configuring_generation.take()
                                     {
-                                        self.gui.show_progress_modal = Some(settings.id);
+                                        self.gui.show_progress_modal(settings.id);
                                         //self.gui.currently_processing = Some(path.clone());
                                         //self.change_sim(device, path.clone(), false);
 
@@ -706,7 +740,7 @@ impl App for ObamifyApp {
                                     self.gui.presets.push(new_preset.clone());
                                     self.change_sim(device, new_preset, self.gui.presets.len() - 1);
                                     self.gui.animate = true;
-                                    self.gui.show_progress_modal = None;
+                                    self.gui.hide_progress_modal();
                                     ui.close();
                                     break;
                                 }
@@ -729,7 +763,7 @@ impl App for ObamifyApp {
                                 }
                                 ProgressMsg::Cancelled => {
                                     self.preview_image = None;
-                                    self.gui.show_progress_modal = None;
+                                    self.gui.hide_progress_modal();
                                     ui.close();
                                 }
                                 ProgressMsg::UpdateAssignments(assignments) => {
@@ -756,7 +790,7 @@ impl App for ObamifyApp {
                                     }
                                     self.worker = None;
                                     self.preview_image = None;
-                                    self.gui.show_progress_modal = None;
+                                    self.gui.hide_progress_modal();
                                     ui.close();
                                 }
                                 self.gui.process_cancelled.store(true, Ordering::Relaxed);
@@ -765,10 +799,6 @@ impl App for ObamifyApp {
                         })
                     });
                 });
-
-            // if modal.should_close() {
-            //     self.gui.show_progress_modal = false;
-            // }
         } else if !self.gif_recorder.not_recording() {
             Modal::new("recording_progress".into()).show(ctx, |ui| {
                 match self.gif_recorder.status.clone() {

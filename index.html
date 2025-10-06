@@ -146,12 +146,6 @@
             z-index: 1000;
         }
 
-        @media (orientation: portrait) {
-            .bottom-left-icons {
-            flex-direction: row;
-            }
-        }
-
         .icon-link {
             position: relative;
             display: flex;
@@ -169,7 +163,6 @@
         .icon-link:hover {
             transform: scale(1.1);
             background-color: rgba(0, 0, 0, 1.0);
-            border-radius: 12px 12px 0 12px;
         }
 
         .icon-link img {
@@ -202,6 +195,10 @@
             padding-left: 18px;
             opacity: 1;
             transform: translateY(0%) translateX(0);
+        }
+
+        .bottom-left-icons:hover .icon-link {
+            border-radius: 12px 12px 0 12px;
         }
     </style>
 </head>
