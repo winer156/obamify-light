@@ -2370,8 +2370,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "obamify_web"
-version = "0.1.0"
+name = "obamify"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "color_quant",

@@ -20,7 +20,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "obamify",
         native_options,
-        Box::new(|cc| Ok(Box::new(obamify_web::ObamifyApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(obamify::ObamifyApp::new(cc)))),
     )
 }
 
@@ -53,7 +53,7 @@ fn start_app() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(obamify_web::ObamifyApp::new(cc)))),
+                Box::new(|cc| Ok(Box::new(obamify::ObamifyApp::new(cc)))),
             )
             .await;
 
@@ -89,7 +89,7 @@ pub fn main() {
         .dyn_ref::<web_sys::DedicatedWorkerGlobalScope>()
         .is_some()
     {
-        obamify_web::worker_entry(); // <- your existing function that sets onmessage, etc.
+        obamify::worker_entry(); // <- your existing function that sets onmessage, etc.
         return;
     }
 
