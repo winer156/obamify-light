@@ -79,34 +79,40 @@ impl GuiState {
     fn show_progress_modal(&mut self, id: Uuid) {
         self.show_progress_modal = Some(id);
         #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast;
-            // hide .bottom-left-icons class while processing
-            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-                if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
-                    web_sys::console::log_1(&"hiding icons".into());
-                    let _ = icons
-                        .dyn_ref::<web_sys::HtmlElement>()
-                        .map(|e| e.style().set_property("display", "none"));
-                }
-            }
-        }
+        hide_icons();
     }
 
     fn hide_progress_modal(&mut self) {
         self.show_progress_modal = None;
         #[cfg(target_arch = "wasm32")]
-        {
-            use wasm_bindgen::JsCast;
-            // show .bottom-left-icons class after processing
-            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-                if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
-                    web_sys::console::log_1(&"showing icons".into());
-                    let _ = icons
-                        .dyn_ref::<web_sys::HtmlElement>()
-                        .map(|e| e.style().set_property("display", "flex"));
-                }
-            }
+        show_icons();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn show_icons() {
+    use wasm_bindgen::JsCast;
+    // show .bottom-left-icons class after processing
+    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+        if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
+            web_sys::console::log_1(&"showing icons".into());
+            let _ = icons
+                .dyn_ref::<web_sys::HtmlElement>()
+                .map(|e| e.style().set_property("display", "flex"));
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn hide_icons() {
+    use wasm_bindgen::JsCast;
+    // hide .bottom-left-icons class while processing
+    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+        if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
+            web_sys::console::log_1(&"hiding icons".into());
+            let _ = icons
+                .dyn_ref::<web_sys::HtmlElement>()
+                .map(|e| e.style().set_property("display", "none"));
         }
     }
 }
@@ -445,6 +451,7 @@ impl App for ObamifyApp {
                                                 GenerationSettings::default(Uuid::new_v4(), name),
                                                 GuiImageCache::default(),
                                             ));
+                                            hide_icons();
                                         },
                                     );
                                 }
@@ -714,6 +721,7 @@ impl App for ObamifyApp {
                                 }
                                 if ui.button("cancel").clicked() {
                                     self.gui.configuring_generation = None;
+                                    show_icons();
                                 }
                             });
                         },

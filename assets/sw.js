@@ -1,5 +1,5 @@
 var cacheName = "obamify-pwa"
-var filesToCache = ["./", "./index.html", "./obamify.js", "./obamify_bg.wasm"]
+var filesToCache = [] //["./", "./index.html", "./obamify.js", "./obamify_bg.wasm"]
 
 /* Start the service worker and cache all of the app's content */
 self.addEventListener("install", function (e) {

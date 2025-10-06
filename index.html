@@ -10,20 +10,20 @@
     <title>obamify</title>
 
     <!-- config for our rust wasm binary. go to https://trunkrs.dev/assets/#rust for more customization -->
-    <link data-trunk rel="rust" data-wasm-opt="4"/>
+    <link data-trunk rel="rust" data-wasm-opt="4" data-integrity="none"/>
     <!-- this is the base url relative to which other urls will be constructed. trunk will insert this from the public-url option -->
     <base data-trunk-public-url />
 
-    <link data-trunk rel="icon" href="assets/favicon.ico">
+    <link data-trunk rel="icon" href="assets/favicon.ico" data-integrity="none">
 
-    <link data-trunk rel="copy-file" href="assets/sw.js" />
+    <link data-trunk rel="copy-file" href="assets/sw.js" data-integrity="none" />
     <link data-trunk rel="copy-file" href="assets/manifest.json"/>
-    <link data-trunk rel="copy-file" href="assets/android-chrome-192x192.png" data-target-path="assets"/>
-    <link data-trunk rel="copy-file" href="assets/android-chrome-512x512.png" data-target-path="assets"/>
-    <link data-trunk rel="copy-file" href="assets/apple-touch-icon.png" data-target-path="assets"/>
-    <link data-trunk rel="copy-file" href="assets/pfp_transparent.png" data-target-path="assets"/>
-    <link data-trunk rel="copy-file" href="assets/github-mark-white.svg" data-target-path="assets"/>
-    <link data-trunk rel="copy-file" href="worker.js"/>
+    <link data-trunk rel="copy-file" href="assets/android-chrome-192x192.png" data-target-path="assets" data-integrity="none"/>
+    <link data-trunk rel="copy-file" href="assets/android-chrome-512x512.png" data-target-path="assets" data-integrity="none"/>
+    <link data-trunk rel="copy-file" href="assets/apple-touch-icon.png" data-target-path="assets" data-integrity="none"/>
+    <link data-trunk rel="copy-file" href="assets/pfp_transparent.png" data-target-path="assets" data-integrity="none"/>
+    <link data-trunk rel="copy-file" href="assets/github-mark-white.svg" data-target-path="assets" data-integrity="none"/>
+    <link data-trunk rel="copy-file" href="worker.js" data-integrity="none"/>
 
 
     <link rel="manifest" href="manifest.json">
@@ -151,10 +151,10 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 64px;
-            height: 64px;
+            width: 48px;
+            height: 48px;
             background-color: rgba(0, 0, 0, 1.0);
-            border-radius: 12px;
+            border-radius: 8px;
             transition: all 0.2s ease;
             text-decoration: none;
             overflow: visible;
@@ -166,26 +166,26 @@
         }
 
         .icon-link img {
-            width: 48px;
-            height: 48px;
+            width: 32px;
+            height: 32px;
             border-radius: 6px;
         }
 
         .icon-text {
             position: absolute;
             left: 100%;
-            top: 50%;
+            bottom: 0;
             background-color: rgba(0, 0, 0, 0.9);
             color: white;
-            padding: 8px 12px;
+            padding: 8px 8px;
             padding-left: 8px;
             border-radius: 0 8px 8px 0;
             font-family: Fira Code, monospace, sans-serif;
-            font-size: 14px;
+            font-size: 10px;
             white-space: nowrap;
             margin-left: 0px;
             opacity: 0;
-            transform: translateY(0%) translateX(-10px);
+            transform: translateX(-10px);
             transition: all 0.3s ease;
             pointer-events: none;
             z-index: 10;
@@ -194,7 +194,7 @@
         .bottom-left-icons:hover .icon-text {
             padding-left: 18px;
             opacity: 1;
-            transform: translateY(0%) translateX(0);
+            transform: translateX(0);
         }
 
         .bottom-left-icons:hover .icon-link {
