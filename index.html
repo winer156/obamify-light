@@ -16,6 +16,7 @@
 
     <link data-trunk rel="icon" href="assets/favicon.ico">
 
+    <link data-trunk rel="copy-file" href="assets/sw.js" />
     <link data-trunk rel="copy-file" href="assets/manifest.json"/>
     <link data-trunk rel="copy-file" href="assets/android-chrome-192x192.png" data-target-path="assets"/>
     <link data-trunk rel="copy-file" href="assets/android-chrome-512x512.png" data-target-path="assets"/>
@@ -230,6 +231,17 @@
             <span class="icon-text">my website</span>
         </a>
     </div>
+
+    <!--Register Service Worker. this will cache the wasm / js scripts for offline use (for PWA functionality). -->
+    <!-- Force refresh (Ctrl + F5) to load the latest files instead of cached files  -->
+    <script>
+        // We disable caching during development so that we always view the latest version.
+        if ('serviceWorker' in navigator && window.location.hash !== "#dev") {
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('sw.js');
+            });
+        }
+    </script>
 </body>
 
 </html>
