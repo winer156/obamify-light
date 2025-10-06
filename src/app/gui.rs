@@ -194,15 +194,13 @@ impl App for ObamifyApp {
         // );
 
         let screen_width = ctx.available_rect().width();
-        let mobile_layout = screen_width < 450.0;
+        let is_landscape = screen_width > ctx.available_rect().height();
+        let mobile_layout = screen_width < 750.0;
 
-        let baseline_zoom = 1.4_f32;
-
-        if (ctx.zoom_factor() - baseline_zoom).abs() > 0.01 {
-            ctx.set_zoom_factor(baseline_zoom);
-        }
+        let baseline_zoom = if is_landscape { 1.4_f32 } else { 1.0_f32 };
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.ctx().set_zoom_factor(baseline_zoom);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), 0.0),
                 if !mobile_layout {
@@ -445,384 +443,344 @@ impl App for ObamifyApp {
                                         .ok();
                                 }
                             }
-
-                            if self.gui.configuring_generation.is_some() {
-                                Window::new("obamification settings")
-                                    .max_width(400.0)
-                                    .max_height(500.0)
-                                    //.scroll([false, true])
-                                    .collapsible(false)
-                                    .movable(false)
-                                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                                    .show(ui.ctx(), |ui| {
-                                        // ui.set_width((screen_width * 0.9).min(400.0));
-                                        // ui.set_max_height(500.0);
-                                        let max_w = ui.available_width();
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(max_w, 0.0),
-                                            egui::Layout::top_down(egui::Align::Center),
-                                            |ui| {
-                                                ui.set_max_width(max_w);
-                                                // ui.add(egui::Label::new(
-                                                //     egui::RichText::new("obamification settings")
-                                                //         .heading()
-                                                //         .strong(),
-                                                // ));
-                                                // ui.separator();
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(max_w, 0.0),
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    )
-                                                    .with_main_wrap(true),
-                                                    |ui| {
-                                                        ui.label("name:");
-                                                        if let Some((_, settings, _)) =
-                                                            self.gui.configuring_generation.as_mut()
-                                                        {
-                                                            ui.text_edit_singleline(
-                                                                &mut settings.name,
-                                                            );
-                                                        }
-                                                    },
-                                                );
-
-                                                ui.separator();
-
-                                                ui.allocate_ui_with_layout(
-                                                    egui::vec2(max_w, 0.0),
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    )
-                                                    .with_main_wrap(true)
-                                                    .with_main_justify(true),
-                                                    |ui| {
-                                                        ui.set_max_width(max_w);
-                                                        if let Some((source_img, settings, cache)) =
-                                                            self.gui.configuring_generation.as_mut()
-                                                        {
-                                                            image_crop_gui(
-                                                                "source image",
-                                                                ui,
-                                                                source_img,
-                                                                &mut settings.source_crop_scale,
-                                                                settings.sidelen,
-                                                                &mut cache.source_preview,
-                                                            );
-
-                                                            // ./arrow-right.svg
-                                                            ui.vertical(|ui| {
-                                                                image_overlap_preview(
-                                                                    "overlap preview",
-                                                                    ui,
-                                                                    settings,
-                                                                    cache,
-                                                                    source_img,
-                                                                    &settings.get_raw_target(),
-                                                                    0.5,
-                                                                );
-                                                                ui.add(
-                                                                    egui::Image::new(
-                                                                        egui::include_image!(
-                                                                            "./arrow-right.svg"
-                                                                        ),
-                                                                    )
-                                                                    .max_size(egui::vec2(
-                                                                        50.0, 50.0,
-                                                                    )),
-                                                                );
-                                                            });
-
-                                                            image_crop_gui(
-                                                                "target image",
-                                                                ui,
-                                                                &settings.get_raw_target(),
-                                                                &mut settings.target_crop_scale,
-                                                                settings.sidelen,
-                                                                &mut cache.target_preview,
-                                                            );
-                                                        }
-                                                    },
-                                                );
-
-                                                ui.separator();
-
-                                                if let Some((_img, settings, _)) =
-                                                    self.gui.configuring_generation.as_mut()
-                                                {
-                                                    ui.allocate_ui_with_layout(
-                                                    egui::vec2(max_w, 0.0),
-                                                    if !mobile_layout {
-                                                        egui::Layout::left_to_right(
-                                                            egui::Align::Center,
-                                                        )
-                                                        .with_main_wrap(true)
-                                                    } else {
-                                                        egui::Layout::top_down(egui::Align::Min)
-                                                    },
-                                                    |ui| {
-                                                        ui.label("proximity importance:");
-
-                                                        let slider_w =
-                                                            ui.available_width().min(260.0);
-                                                        ui.add_sized(
-                                                            [slider_w, 20.0],
-                                                            egui::Slider::new(
-                                                                &mut settings.proximity_importance,
-                                                                0..=50,
-                                                            ),
-                                                        );
-
-                                                        let mut algorithm = match settings.algorithm
-                                                        {
-                                                            calculate::util::Algorithm::Optimal => {
-                                                                "optimal algorithm"
-                                                            }
-                                                            calculate::util::Algorithm::Genetic => {
-                                                                "fast algorithm"
-                                                            }
-                                                        };
-
-                                                        egui::ComboBox::from_id_salt(
-                                                            "algorithm_select",
-                                                        )
-                                                        .selected_text(algorithm)
-                                                        .show_ui(ui, |ui| {
-                                                            if ui
-                                                                .button("optimal algorithm")
-                                                                .clicked()
-                                                            {
-                                                                algorithm = "optimal algorithm";
-                                                                settings.algorithm =
-                                                                calculate::util::Algorithm::Optimal;
-                                                            }
-                                                            if ui.button("fast algorithm").clicked()
-                                                            {
-                                                                algorithm = "fast algorithm";
-                                                                settings.algorithm =
-                                                                calculate::util::Algorithm::Genetic;
-                                                            }
-                                                        });
-                                                    },
-                                                );
-                                                }
-                                                ui.separator();
-                                                ui.horizontal_wrapped(|ui| {
-                                                    if ui
-                                                        .add(egui::Button::new(
-                                                            egui::RichText::new("start!").strong(),
-                                                        ))
-                                                        .clicked()
-                                                    {
-                                                        if let Some((img, settings, _)) =
-                                                            self.gui.configuring_generation.take()
-                                                        {
-                                                            self.gui.show_progress_modal =
-                                                                Some(settings.id);
-                                                            //self.gui.currently_processing = Some(path.clone());
-                                                            //self.change_sim(device, path.clone(), false);
-
-                                                            self.gui.process_cancelled.store(
-                                                            false,
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        );
-
-                                                            let unprocessed = UnprocessedPreset {
-                                                                name: settings.name.clone(),
-                                                                width: img.width(),
-                                                                height: img.height(),
-                                                                source_img: img.into_raw(),
-                                                            };
-
-                                                            #[cfg(target_arch = "wasm32")]
-                                                            {
-                                                                self.start_job(
-                                                                    unprocessed,
-                                                                    settings,
-                                                                );
-                                                            }
-
-                                                            #[cfg(not(target_arch = "wasm32"))]
-                                                            {
-                                                                std::thread::spawn({
-                                                                    let tx =
-                                                                        self.progress_tx.clone();
-                                                                    let cancelled = self
-                                                                        .gui
-                                                                        .process_cancelled
-                                                                        .clone();
-                                                                    move || {
-                                                                        let result =
-                                                                            calculate::process(
-                                                                                unprocessed,
-                                                                                settings,
-                                                                                &mut tx.clone(),
-                                                                                cancelled,
-                                                                            );
-                                                                        if let Err(err) = result {
-                                                                            tx.send(
-                                                                                ProgressMsg::Error(
-                                                                                    err.to_string(),
-                                                                                ),
-                                                                            )
-                                                                            .ok();
-                                                                        }
-                                                                    }
-                                                                });
-                                                            }
-                                                        }
-                                                    }
-                                                    if ui.button("cancel").clicked() {
-                                                        self.gui.configuring_generation = None;
-                                                    }
-                                                });
-                                            },
-                                        );
-                                    });
-                            }
-
-                            if let Some(progress_id) = self.gui.show_progress_modal {
-                                Window::new(progress_id.to_string())
-                                    .title_bar(false)
-                                    .collapsible(false)
-                                    .movable(false)
-                                    .resizable(false)
-                                    .anchor(egui::Align2::CENTER_BOTTOM, (0.0, 0.0))
-                                    .show(ui.ctx(), |ui| {
-                                        let processing_label_message = "processing...";
-                                        ui.vertical(|ui| {
-                                            ui.set_min_width(ui.available_width().min(400.0));
-                                            while let Some(msg) = self.get_latest_msg() {
-                                                match msg {
-                                                    ProgressMsg::Done(new_preset) => {
-                                                        self.preview_image = None;
-                                                        //self.gui.presets = get_presets();
-                                                        self.gui.presets.push(new_preset.clone());
-                                                        self.change_sim(
-                                                            device,
-                                                            new_preset,
-                                                            self.gui.presets.len() - 1,
-                                                        );
-                                                        self.gui.animate = true;
-                                                        self.gui.show_progress_modal = None;
-                                                        ui.close();
-                                                        break;
-                                                    }
-                                                    ProgressMsg::Progress(p) => {
-                                                        self.gui.last_progress = p;
-                                                    }
-                                                    ProgressMsg::Error(err) => {
-                                                        ui.label(format!("error: {}", err));
-                                                        if ui.button("close").clicked() {
-                                                            ui.close();
-                                                        }
-                                                    }
-                                                    ProgressMsg::UpdatePreview {
-                                                        width,
-                                                        height,
-                                                        data,
-                                                    } => {
-                                                        let image = image::ImageBuffer::from_vec(
-                                                            width, height, data,
-                                                        );
-                                                        self.preview_image = image;
-                                                    }
-                                                    ProgressMsg::Cancelled => {
-                                                        self.preview_image = None;
-                                                        self.gui.show_progress_modal = None;
-                                                        ui.close();
-                                                    }
-                                                    ProgressMsg::UpdateAssignments(assignments) => {
-                                                        self.sim.set_assignments(
-                                                            assignments,
-                                                            self.size.0,
-                                                        )
-                                                    }
-                                                }
-                                            }
-
-                                            if self.gui.process_cancelled.load(Ordering::Relaxed) {
-                                                ui.label("cancelling...");
-                                            } else if self.gui.last_progress == 0.0 {
-                                                ui.label("preparing...");
-                                            } else {
-                                                ui.label(processing_label_message);
-                                            }
-                                            ui.add(
-                                                egui::ProgressBar::new(self.gui.last_progress)
-                                                    .show_percentage(),
-                                            );
-
-                                            ui.horizontal(|ui| {
-                                                if ui.button("cancel").clicked() {
-                                                    #[cfg(target_arch = "wasm32")]
-                                                    {
-                                                        if let Some(w) = &self.worker {
-                                                            w.terminate();
-                                                        }
-                                                        self.worker = None;
-                                                        self.preview_image = None;
-                                                        self.gui.show_progress_modal = None;
-                                                        ui.close();
-                                                    }
-                                                    self.gui
-                                                        .process_cancelled
-                                                        .store(true, Ordering::Relaxed);
-                                                    self.gui.last_progress = 0.0;
-                                                }
-                                            })
-                                        });
-                                    });
-
-                                // if modal.should_close() {
-                                //     self.gui.show_progress_modal = false;
-                                // }
-                            } else if !self.gif_recorder.not_recording() {
-                                Modal::new("recording_progress".into()).show(ui.ctx(), |ui| {
-                                    match self.gif_recorder.status.clone() {
-                                        GifStatus::Recording => {
-                                            ui.label("Recording GIF...");
-                                            if ui.button("cancel").clicked() {
-                                                self.stop_recording_gif(device);
-                                                self.gui.animate = false;
-                                            }
-                                        }
-
-                                        GifStatus::Error(err) => {
-                                            ui.label(format!("Error: {}", err));
-                                            ui.horizontal(|ui| {
-                                                if ui.button("close").clicked() {
-                                                    self.stop_recording_gif(device);
-                                                }
-                                            });
-                                        }
-                                        #[cfg(not(target_arch = "wasm32"))]
-                                        GifStatus::Complete(path) => {
-                                            ui.label("gif saved!");
-                                            ui.horizontal(|ui| {
-                                                if ui.button("open file").clicked() {
-                                                    opener::reveal(path).ok();
-                                                }
-                                                if ui.button("close").clicked() {
-                                                    self.stop_recording_gif(device);
-                                                }
-                                            });
-                                        }
-                                        #[cfg(target_arch = "wasm32")]
-                                        GifStatus::Complete => {
-                                            // save opens dialog automatically
-                                            self.stop_recording_gif(device);
-                                        }
-                                        GifStatus::None => unreachable!(),
-                                    }
-                                });
-                            }
                         }
                     }
                 },
             );
         });
+        if self.gui.configuring_generation.is_some() {
+            Window::new("obamification settings")
+                .max_width(screen_width.min(400.0) * 0.8)
+                //.max_height(500.0)
+                .resizable(false)
+                .collapsible(false)
+                .movable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    //ctx.set_zoom_factor((screen_width / 400.0).max(1.0) * baseline_zoom);
+                    // ui.set_width((screen_width * 0.9).min(400.0));
+                    // ui.set_max_height(500.0);
+                    let max_w = ui.available_width();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(max_w, 0.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.set_max_width(max_w);
+                            // ui.add(egui::Label::new(
+                            //     egui::RichText::new("obamification settings")
+                            //         .heading()
+                            //         .strong(),
+                            // ));
+                            // ui.separator();
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(max_w, 0.0),
+                                egui::Layout::left_to_right(egui::Align::Center)
+                                    .with_main_wrap(true),
+                                |ui| {
+                                    ui.label("name:");
+                                    if let Some((_, settings, _)) =
+                                        self.gui.configuring_generation.as_mut()
+                                    {
+                                        ui.text_edit_singleline(&mut settings.name);
+                                    }
+                                },
+                            );
 
+                            ui.separator();
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(max_w, 0.0),
+                                egui::Layout::left_to_right(egui::Align::Center)
+                                    .with_main_wrap(true)
+                                    .with_main_justify(true),
+                                |ui| {
+                                    ui.set_max_width(max_w);
+                                    if let Some((source_img, settings, cache)) =
+                                        self.gui.configuring_generation.as_mut()
+                                    {
+                                        image_crop_gui(
+                                            "source image",
+                                            ui,
+                                            source_img,
+                                            &mut settings.source_crop_scale,
+                                            &mut cache.source_preview,
+                                        );
+                                        if is_landscape {
+                                            // ./arrow-right.svg
+                                            ui.vertical(|ui| {
+                                                image_overlap_preview(
+                                                    "overlap preview",
+                                                    ui,
+                                                    settings,
+                                                    cache,
+                                                    source_img,
+                                                    &settings.get_raw_target(),
+                                                    0.5,
+                                                );
+
+                                                ui.add(
+                                                    egui::Image::new(egui::include_image!(
+                                                        "./arrow-right.svg"
+                                                    ))
+                                                    .max_size(egui::vec2(50.0, 50.0)),
+                                                );
+                                            });
+                                        }
+
+                                        image_crop_gui(
+                                            "target image",
+                                            ui,
+                                            &settings.get_raw_target(),
+                                            &mut settings.target_crop_scale,
+                                            &mut cache.target_preview,
+                                        );
+                                    }
+                                },
+                            );
+
+                            ui.separator();
+
+                            if let Some((_img, settings, _)) =
+                                self.gui.configuring_generation.as_mut()
+                            {
+                                egui::CollapsingHeader::new("advanced settings")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(max_w, 0.0),
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                let slider_w = ui.available_width().min(260.0);
+                                                ui.add_sized(
+                                                    [slider_w, 20.0],
+                                                    egui::Slider::new(
+                                                        &mut settings.sidelen,
+                                                        64..=256,
+                                                    )
+                                                    .text("resolution"),
+                                                );
+
+                                                let slider_w = ui.available_width().min(260.0);
+                                                ui.add_sized(
+                                                    [slider_w, 20.0],
+                                                    egui::Slider::new(
+                                                        &mut settings.proximity_importance,
+                                                        0..=50,
+                                                    )
+                                                    .text("proximity importance"),
+                                                );
+
+                                                let mut algorithm = match settings.algorithm {
+                                                    calculate::util::Algorithm::Optimal => {
+                                                        "optimal algorithm"
+                                                    }
+                                                    calculate::util::Algorithm::Genetic => {
+                                                        "fast algorithm"
+                                                    }
+                                                };
+
+                                                egui::ComboBox::from_id_salt("algorithm_select")
+                                                    .selected_text(algorithm)
+                                                    .show_ui(ui, |ui| {
+                                                        if ui.button("optimal algorithm").clicked()
+                                                        {
+                                                            algorithm = "optimal algorithm";
+                                                            settings.algorithm =
+                                                                calculate::util::Algorithm::Optimal;
+                                                        }
+                                                        if ui.button("fast algorithm").clicked() {
+                                                            algorithm = "fast algorithm";
+                                                            settings.algorithm =
+                                                                calculate::util::Algorithm::Genetic;
+                                                        }
+                                                    });
+                                            },
+                                        );
+                                    });
+                            }
+                            ui.separator();
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add(egui::Button::new(egui::RichText::new("start!").strong()))
+                                    .clicked()
+                                {
+                                    if let Some((img, settings, _)) =
+                                        self.gui.configuring_generation.take()
+                                    {
+                                        self.gui.show_progress_modal = Some(settings.id);
+                                        //self.gui.currently_processing = Some(path.clone());
+                                        //self.change_sim(device, path.clone(), false);
+
+                                        self.gui
+                                            .process_cancelled
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+                                        let unprocessed = UnprocessedPreset {
+                                            name: settings.name.clone(),
+                                            width: img.width(),
+                                            height: img.height(),
+                                            source_img: img.into_raw(),
+                                        };
+
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            self.start_job(unprocessed, settings);
+                                        }
+
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        {
+                                            std::thread::spawn({
+                                                let tx = self.progress_tx.clone();
+                                                let cancelled = self.gui.process_cancelled.clone();
+                                                move || {
+                                                    let result = calculate::process(
+                                                        unprocessed,
+                                                        settings,
+                                                        &mut tx.clone(),
+                                                        cancelled,
+                                                    );
+                                                    if let Err(err) = result {
+                                                        tx.send(ProgressMsg::Error(
+                                                            err.to_string(),
+                                                        ))
+                                                        .ok();
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                if ui.button("cancel").clicked() {
+                                    self.gui.configuring_generation = None;
+                                }
+                            });
+                        },
+                    );
+                });
+        }
+
+        if let Some(progress_id) = self.gui.show_progress_modal {
+            Window::new(progress_id.to_string())
+                .title_bar(false)
+                .collapsible(false)
+                .movable(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_BOTTOM, (0.0, 0.0))
+                .show(ctx, |ui| {
+                    let processing_label_message = "processing...";
+                    ui.vertical(|ui| {
+                        ui.set_min_width(ui.available_width().min(400.0));
+                        while let Some(msg) = self.get_latest_msg() {
+                            match msg {
+                                ProgressMsg::Done(new_preset) => {
+                                    self.preview_image = None;
+                                    //self.gui.presets = get_presets();
+                                    self.gui.presets.push(new_preset.clone());
+                                    self.change_sim(device, new_preset, self.gui.presets.len() - 1);
+                                    self.gui.animate = true;
+                                    self.gui.show_progress_modal = None;
+                                    ui.close();
+                                    break;
+                                }
+                                ProgressMsg::Progress(p) => {
+                                    self.gui.last_progress = p;
+                                }
+                                ProgressMsg::Error(err) => {
+                                    ui.label(format!("error: {}", err));
+                                    if ui.button("close").clicked() {
+                                        ui.close();
+                                    }
+                                }
+                                ProgressMsg::UpdatePreview {
+                                    width,
+                                    height,
+                                    data,
+                                } => {
+                                    let image = image::ImageBuffer::from_vec(width, height, data);
+                                    self.preview_image = image;
+                                }
+                                ProgressMsg::Cancelled => {
+                                    self.preview_image = None;
+                                    self.gui.show_progress_modal = None;
+                                    ui.close();
+                                }
+                                ProgressMsg::UpdateAssignments(assignments) => {
+                                    self.sim.set_assignments(assignments, self.size.0)
+                                }
+                            }
+                        }
+
+                        if self.gui.process_cancelled.load(Ordering::Relaxed) {
+                            ui.label("cancelling...");
+                        } else if self.gui.last_progress == 0.0 {
+                            ui.label("preparing...");
+                        } else {
+                            ui.label(processing_label_message);
+                        }
+                        ui.add(egui::ProgressBar::new(self.gui.last_progress).show_percentage());
+
+                        ui.horizontal(|ui| {
+                            if ui.button("cancel").clicked() {
+                                #[cfg(target_arch = "wasm32")]
+                                {
+                                    if let Some(w) = &self.worker {
+                                        w.terminate();
+                                    }
+                                    self.worker = None;
+                                    self.preview_image = None;
+                                    self.gui.show_progress_modal = None;
+                                    ui.close();
+                                }
+                                self.gui.process_cancelled.store(true, Ordering::Relaxed);
+                                self.gui.last_progress = 0.0;
+                            }
+                        })
+                    });
+                });
+
+            // if modal.should_close() {
+            //     self.gui.show_progress_modal = false;
+            // }
+        } else if !self.gif_recorder.not_recording() {
+            Modal::new("recording_progress".into()).show(ctx, |ui| {
+                match self.gif_recorder.status.clone() {
+                    GifStatus::Recording => {
+                        ui.label("Recording GIF...");
+                        if ui.button("cancel").clicked() {
+                            self.stop_recording_gif(device);
+                            self.gui.animate = false;
+                        }
+                    }
+
+                    GifStatus::Error(err) => {
+                        ui.label(format!("Error: {}", err));
+                        ui.horizontal(|ui| {
+                            if ui.button("close").clicked() {
+                                self.stop_recording_gif(device);
+                            }
+                        });
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    GifStatus::Complete(path) => {
+                        ui.label("gif saved!");
+                        ui.horizontal(|ui| {
+                            if ui.button("open file").clicked() {
+                                opener::reveal(path).ok();
+                            }
+                            if ui.button("close").clicked() {
+                                self.stop_recording_gif(device);
+                            }
+                        });
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    GifStatus::Complete => {
+                        // save opens dialog automatically
+                        self.stop_recording_gif(device);
+                    }
+                    GifStatus::None => unreachable!(),
+                }
+            });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(ctx, |ui| {
@@ -1111,7 +1069,6 @@ fn image_crop_gui(
     ui: &mut egui::Ui,
     img: &SourceImg,
     crop_scale: &mut CropScale,
-    sidelen: u32,
     cache: &mut Option<TextureHandle>,
 ) {
     ui.vertical(|ui| {
@@ -1119,7 +1076,7 @@ fn image_crop_gui(
             None => {
                 let p = ui.ctx().load_texture(
                     name,
-                    egui::ColorImage::from_rgb([128, 128], crop_scale.apply(img, sidelen).as_raw()),
+                    egui::ColorImage::from_rgb([128, 128], crop_scale.apply(img, 128).as_raw()),
                     egui::TextureOptions::LINEAR,
                 );
                 *cache = Some(p.clone());
