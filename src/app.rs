@@ -224,35 +224,6 @@ impl ObamifyApp {
             .clone();
         let device = &rs.device;
         let size = (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION);
-        // let seed_count = 4096;
-        // let mut seeds = Vec::with_capacity(seed_count as usize);
-        // let mut colors = Vec::with_capacity(seed_count as usize);
-        // for x in 0..64 {
-        //     for y in 0..64 {
-        //         seeds.push(SeedPos {
-        //             xy: [
-        //                 (x as f32 + 0.5 + rng.gen::<f32>()) * (size.0 as f32 / 64.0),
-        //                 (y as f32 + 0.5 + rng.gen::<f32>()) * (size.1 as f32 / 64.0),
-        //             ],
-        //             // rgb: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]][rng.gen_range(0..3)],
-        //             // _pad: [0.0, 0.0, 0.0],
-        //         });
-
-        //         colors.push(SeedColor {
-        //             rgba: [
-        //                 [1.0, 0.0, 0.0, 1.0],
-        //                 [0.0, 1.0, 0.0, 1.0],
-        //                 [0.0, 0.0, 1.0, 1.0],
-        //             ][rng.gen_range(0..3)],
-        //         });
-        //     }
-        // }
-        // seeds.push(SeedPos {
-        //     xy: [size.1 as f32 * 0.55, size.1 as f32 * 0.55],
-        // });
-        // seeds.push(SeedPos {
-        //     xy: [size.1 as f32 * 0.45, size.1 as f32 * 0.45],
-        // });
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // get all folders in ../presets

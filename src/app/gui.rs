@@ -53,6 +53,7 @@ pub(crate) struct GuiState {
     //pub current_settings: GenerationSettings,
     configuring_generation: Option<(SourceImg, GenerationSettings, GuiImageCache)>,
     pub current_preset: usize,
+    error_message: Option<String>,
 }
 
 impl GuiState {
@@ -73,6 +74,7 @@ impl GuiState {
             //current_settings: GenerationSettings::default(),
             configuring_generation: None,
             current_preset,
+            error_message: None,
         }
     }
 
@@ -86,6 +88,14 @@ impl GuiState {
         self.show_progress_modal = None;
         #[cfg(target_arch = "wasm32")]
         show_icons();
+    }
+
+    fn show_error(&mut self, msg: String) {
+        self.error_message = Some(msg);
+    }
+
+    fn hide_error(&mut self) {
+        self.error_message = None;
     }
 }
 
@@ -813,7 +823,7 @@ impl App for ObamifyApp {
             Modal::new("recording_progress".into()).show(ctx, |ui| {
                 match self.gif_recorder.status.clone() {
                     GifStatus::Recording => {
-                        ui.label("Recording GIF...");
+                        ui.label("recording gif...");
                         if ui.button("cancel").clicked() {
                             self.stop_recording_gif(device);
                             self.gui.animate = false;
@@ -848,6 +858,23 @@ impl App for ObamifyApp {
                     GifStatus::None => unreachable!(),
                 }
             });
+        }
+        if let Some(err) = &self.gui.error_message {
+            let mut close = false;
+            Window::new("error")
+                .collapsible(false)
+                .movable(true)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(err);
+                    if ui.button("close").clicked() {
+                        close = true;
+                    }
+                });
+            if close {
+                self.gui.hide_error();
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
@@ -1062,14 +1089,17 @@ fn prompt_image(
             {
                 let name = get_default_preset_name(handle.file_name());
                 let data = handle.read().await;
-                if let Ok(img) = image::load_from_memory(&data) {
-                    // SAFETY: We ensure the app outlives the async task (eframe app is long-lived).
-                    // We only mutate a simple field after the dialog completes.
-                    unsafe {
+                match image::load_from_memory(&data) {
+                    Ok(img) => unsafe {
                         if let Some(app) = app_ptr.as_mut() {
-                            callback(name, img.to_rgb8(), app)
+                            callback(name, img.to_rgb8(), app);
                         }
-                    }
+                    },
+                    Err(e) => unsafe {
+                        if let Some(app) = app_ptr.as_mut() {
+                            app.gui.show_error(format!("failed to load image: {}", e));
+                        }
+                    },
                 }
             }
         });
@@ -1084,11 +1114,11 @@ fn prompt_image(
         {
             let name =
                 get_default_preset_name(file.file_name().unwrap().to_string_lossy().to_string());
-            callback(
-                name,
-                image::open(file).expect("failed to open image").to_rgb8(),
-                app,
-            );
+
+            match image::open(file) {
+                Ok(img) => callback(name, img.to_rgb8(), app),
+                Err(e) => app.gui.show_error(format!("failed to load image: {}", e)),
+            }
         }
     }
 }
