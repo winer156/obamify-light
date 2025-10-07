@@ -5,6 +5,10 @@ on:
 
 env:
     BIN_NAME: obamify
+    # Human-facing display name for the app
+    APP_DISPLAY_NAME: obamify
+    # Reverse-DNS bundle identifier
+    APP_BUNDLE_ID: com.obamify
 
 jobs:
     build:
@@ -18,12 +22,10 @@ jobs:
                       os_tag: linux
                       target: x86_64-unknown-linux-gnu
                       ext: ""
-                      zip_cmd: zip -r
                     - runner: macos-14
                       os_tag: macos
                       target: aarch64-apple-darwin
                       ext: ""
-                      zip_cmd: zip -r
                     - runner: windows-latest
                       os_tag: windows
                       target: x86_64-pc-windows-msvc
@@ -36,59 +38,157 @@ jobs:
               with:
                   targets: ${{ matrix.target }}
 
-            # Works on all OSes (default shell is bash on Linux/macOS, pwsh on Windows)
             - name: Cargo build (release)
               run: cargo build --release --target ${{ matrix.target }}
 
-            # ---- Package on Linux/macOS (bash) ----
-            - name: Package (Unix)
-              if: ${{ !startsWith(matrix.runner, 'windows') }}
+            - name: Package (.app bundle)
+              if: ${{ startsWith(matrix.runner, 'macos') }}
+              shell: bash
               run: |
                   set -euo pipefail
                   APP="${{ env.BIN_NAME }}"
-                  PKG="dist/${APP}-${{ matrix.os_tag }}"
+                  DISP="${{ env.APP_DISPLAY_NAME }}"
+                  BUNDLE_ID="${{ env.APP_BUNDLE_ID }}"
                   BIN="target/${{ matrix.target }}/release/${APP}${{ matrix.ext }}"
                   test -f "$BIN" || (echo "Missing $BIN" && exit 1)
 
-                  mkdir -p "$PKG"
-                  cp "$BIN" "$PKG/"
+                  # Derive version from Cargo metadata (fallback to 0.0.0)
+                  VERSION="$(cargo metadata --format-version 1 --no-deps | python3 -c "import sys, json; m=json.load(sys.stdin); p=[x for x in m['packages'] if x['name']=='${APP}']; print(p[0]['version'] if p else '0.0.0')")"
 
-                  test -d presets || (echo "./presets missing" && exit 1)
-                  cp -R presets "$PKG/"
+                  APPDIR="dist/${DISP}.app"
+                  mkdir -p "${APPDIR}/Contents/MacOS" "${APPDIR}/Contents/Resources"
 
-                  test -f target.png || (echo "./target.png missing" && exit 1)
-                  test -f weights.png || (echo "./weights.png missing" && exit 1)
-                  test -f blank.png || (echo "./weights.png missing" && exit 1)
-                  cp target.png weights.png blank.png "$PKG/"
+                  # Binary
+                  cp "$BIN" "${APPDIR}/Contents/MacOS/${APP}"
+                  chmod +x "${APPDIR}/Contents/MacOS/${APP}"
 
-                  (cd dist && ${{ matrix.zip_cmd }} "${APP}-${{ matrix.os_tag }}.zip" "${APP}-${{ matrix.os_tag }}")
+                  # Icon (optional) - put your .icns at assets/macos/icon.icns
+                  if [ -f assets/macos/icon.icns ]; then
+                    cp assets/macos/icon.icns "${APPDIR}/Contents/Resources/AppIcon.icns"
+                    ICON_LINE="<key>CFBundleIconFile</key><string>AppIcon</string>"
+                  else
+                    ICON_LINE=""
+                  fi
 
-            # ---- Package on Windows (PowerShell) ----
+                  # Generate Info.plist
+                  cat > "${APPDIR}/Contents/Info.plist" <<PLIST
+                  <?xml version="1.0" encoding="UTF-8"?>
+                  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                  <plist version="1.0">
+                  <dict>
+                    <key>CFBundleName</key><string>${DISP}</string>
+                    <key>CFBundleDisplayName</key><string>${DISP}</string>
+                    <key>CFBundleExecutable</key><string>${APP}</string>
+                    <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
+                    <key>CFBundleVersion</key><string>${VERSION}</string>
+                    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+                    <key>LSMinimumSystemVersion</key><string>11.0</string>
+                    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+                    <key>NSHighResolutionCapable</key><true/>
+                    ${ICON_LINE}
+                  </dict>
+                  </plist>
+                  PLIST
+
+                  # Zip for distribution (zip keeps resource forks properly with ditto flags)
+                  mkdir -p dist
+                  ditto -c -k --sequesterRsrc --keepParent "${APPDIR}" "dist/${APP}-${{ matrix.os_tag }}.zip"
+
+            - name: Package (Linux AppImage)
+              if: ${{ startsWith(matrix.runner, 'ubuntu') }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  APP="${{ env.BIN_NAME }}"
+                  DISP="${{ env.APP_DISPLAY_NAME }}"
+                  BIN="target/${{ matrix.target }}/release/${APP}"
+                  test -f "$BIN" || (echo "Missing $BIN" && exit 1)
+
+                  mkdir -p dist/AppDir/usr/bin dist/AppDir/usr/share/applications dist/AppDir/usr/share/icons/hicolor/256x256/apps
+
+                  # Put binary in AppDir
+                  cp "$BIN" dist/AppDir/usr/bin/${APP}
+                  chmod +x dist/AppDir/usr/bin/${APP}
+
+                  # Icon (optional) - place a 256x256 PNG at assets/linux/icon.png
+                  if [ -f assets/linux/icon.png ]; then
+                    cp assets/linux/icon.png dist/AppDir/usr/share/icons/hicolor/256x256/apps/${APP}.png
+                    ICON_PATH=dist/AppDir/usr/share/icons/hicolor/256x256/apps/${APP}.png
+                  else
+                    ICON_PATH=
+                  fi
+
+                  # Desktop file
+                  cat > dist/AppDir/usr/share/applications/${APP}.desktop <<DESKTOP
+                  [Desktop Entry]
+                  Type=Application
+                  Name=${DISP}
+                  Exec=${APP}
+                  Icon=${APP}
+                  Categories=Utility;
+                  Terminal=false
+                  DESKTOP
+
+                  # AppRun launcher
+                  cat > dist/AppDir/AppRun <<'APPRUN'
+                  #!/bin/sh
+                  HERE="$(dirname "$(readlink -f "$0")")"
+                  export PATH="$HERE/usr/bin:$PATH"
+                  exec "${HERE}/usr/bin/${APP_BIN:-${APP}}" "$@"
+                  APPRUN
+                  sed -i "s/\${APP}/${APP}/g" dist/AppDir/AppRun
+                  chmod +x dist/AppDir/AppRun
+
+                  # Fetch linuxdeploy + appimagetool
+                  wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" -O linuxdeploy
+                  wget -q "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage" -O appimagetool
+                  chmod +x linuxdeploy appimagetool
+
+                  # Build AppImage
+                  ./linuxdeploy --appdir dist/AppDir \
+                    -d dist/AppDir/usr/share/applications/${APP}.desktop \
+                    $( [ -n "$ICON_PATH" ] && echo "-i $ICON_PATH" ) \
+                    --output appimage
+
+                  # Move result(s) to dist with stable name
+                  mkdir -p dist
+                  mv *.AppImage "dist/${APP}-${{ matrix.os_tag }}.AppImage" || true
+
+                  # Tarball fallback
+                  tar -C "target/${{ matrix.target }}/release" -czf "dist/${APP}-${{ matrix.os_tag }}.tar.gz" "${APP}"
+
             - name: Package (Windows)
               if: startsWith(matrix.runner, 'windows')
               shell: pwsh
               run: |
                   $ErrorActionPreference = "Stop"
                   $App = "${{ env.BIN_NAME }}"
-                  $Pkg = "dist/$App-${{ matrix.os_tag }}"
                   $Bin = "target/${{ matrix.target }}/release/$App${{ matrix.ext }}"
-
                   if (-not (Test-Path $Bin)) { throw "Missing $Bin" }
-                  New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
-                  Copy-Item $Bin -Destination $Pkg -Force
+                  New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+                  Copy-Item $Bin -Destination "dist/$App-${{ matrix.os_tag }}${{ matrix.ext }}" -Force
 
-                  if (-not (Test-Path "presets")) { throw "./presets missing" }
-                  Copy-Item -Recurse -Force "presets" $Pkg
-
-                  if (-not (Test-Path "target.png")) { throw "./target.png missing" }
-                  if (-not (Test-Path "weights.png")) { throw "./weights.png missing" }
-                  if (-not (Test-Path "blank.png")) { throw "./blank.png missing" }
-                  Copy-Item "target.png","weights.png","blank.png" -Destination $Pkg -Force
-
-                  Compress-Archive -Path "$Pkg/*" -DestinationPath "dist/$App-${{ matrix.os_tag }}.zip" -Force
-
-            - name: Upload artifacts
+            - name: Upload artifacts (macOS)
+              if: ${{ startsWith(matrix.runner, 'macos') }}
               uses: actions/upload-artifact@v4
               with:
                   name: ${{ env.BIN_NAME }}-${{ matrix.os_tag }}
-                  path: dist/*.zip
+                  path: |
+                      dist/${{ env.APP_DISPLAY_NAME }}.app
+                      dist/${{ env.BIN_NAME }}-${{ matrix.os_tag }}.zip
+
+            - name: Upload artifacts (Linux)
+              if: ${{ startsWith(matrix.runner, 'ubuntu') }}
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ env.BIN_NAME }}-${{ matrix.os_tag }}
+                  path: |
+                      dist/${{ env.BIN_NAME }}-${{ matrix.os_tag }}.AppImage
+                      dist/${{ env.BIN_NAME }}-${{ matrix.os_tag }}.tar.gz
+
+            - name: Upload artifacts (Windows)
+              if: startsWith(matrix.runner, 'windows')
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ env.BIN_NAME }}-${{ matrix.os_tag }}
+                  path: dist/${{ env.BIN_NAME }}-${{ matrix.os_tag }}${{ matrix.ext }}
