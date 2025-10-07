@@ -451,6 +451,7 @@ impl App for ObamifyApp {
                                                 GenerationSettings::default(Uuid::new_v4(), name),
                                                 GuiImageCache::default(),
                                             ));
+                                            #[cfg(target_arch = "wasm32")]
                                             hide_icons();
                                         },
                                     );
@@ -721,6 +722,7 @@ impl App for ObamifyApp {
                                 }
                                 if ui.button("cancel").clicked() {
                                     self.gui.configuring_generation = None;
+                                    #[cfg(target_arch = "wasm32")]
                                     show_icons();
                                 }
                             });
