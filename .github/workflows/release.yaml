@@ -102,23 +102,30 @@ jobs:
                   APP="${{ env.BIN_NAME }}"
                   DISP="${{ env.APP_DISPLAY_NAME }}"
                   BIN="target/${{ matrix.target }}/release/${APP}"
+
+                  echo "Checking for binary at: $BIN"
                   test -f "$BIN" || (echo "Missing $BIN" && exit 1)
 
+                  echo "Creating AppDir structure..."
                   mkdir -p dist/AppDir/usr/bin dist/AppDir/usr/share/applications dist/AppDir/usr/share/icons/hicolor/256x256/apps
 
                   # Put binary in AppDir
+                  echo "Copying binary..."
                   cp "$BIN" dist/AppDir/usr/bin/${APP}
                   chmod +x dist/AppDir/usr/bin/${APP}
 
                   # Icon (optional) - place a 256x256 PNG at assets/linux/icon.png
                   if [ -f assets/linux/icon.png ]; then
+                    echo "Copying icon..."
                     cp assets/linux/icon.png dist/AppDir/usr/share/icons/hicolor/256x256/apps/${APP}.png
                     ICON_PATH=dist/AppDir/usr/share/icons/hicolor/256x256/apps/${APP}.png
                   else
+                    echo "No icon found, proceeding without..."
                     ICON_PATH=
                   fi
 
                   # Desktop file
+                  echo "Creating desktop file..."
                   cat > dist/AppDir/usr/share/applications/${APP}.desktop <<DESKTOP
                   [Desktop Entry]
                   Type=Application
@@ -130,32 +137,51 @@ jobs:
                   DESKTOP
 
                   # AppRun launcher
+                  echo "Creating AppRun launcher..."
                   cat > dist/AppDir/AppRun <<'APPRUN'
                   #!/bin/sh
                   HERE="$(dirname "$(readlink -f "$0")")"
                   export PATH="$HERE/usr/bin:$PATH"
-                  exec "${HERE}/usr/bin/${APP_BIN:-${APP}}" "$@"
+                  exec "${HERE}/usr/bin/obamify" "$@"
                   APPRUN
-                  sed -i "s/\${APP}/${APP}/g" dist/AppDir/AppRun
                   chmod +x dist/AppDir/AppRun
 
-                  # Fetch linuxdeploy + appimagetool
-                  wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" -O linuxdeploy
-                  wget -q "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage" -O appimagetool
-                  chmod +x linuxdeploy appimagetool
-
-                  # Build AppImage
-                  ./linuxdeploy --appdir dist/AppDir \
-                    -d dist/AppDir/usr/share/applications/${APP}.desktop \
-                    $( [ -n "$ICON_PATH" ] && echo "-i $ICON_PATH" ) \
-                    --output appimage
-
-                  # Move result(s) to dist with stable name
+                  # Create tarball first (guaranteed to work)
+                  echo "Creating tarball..."
                   mkdir -p dist
-                  mv *.AppImage "dist/${APP}-${{ matrix.os_tag }}.AppImage" || true
-
-                  # Tarball fallback
                   tar -C "target/${{ matrix.target }}/release" -czf "dist/${APP}-${{ matrix.os_tag }}.tar.gz" "${APP}"
+
+                  # Try to create AppImage (may fail on some systems)
+                  echo "Attempting to create AppImage..."
+                  if command -v wget >/dev/null 2>&1; then
+                    echo "Downloading AppImage tools..."
+                    wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" -O linuxdeploy || echo "Failed to download linuxdeploy"
+                    wget -q "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage" -O appimagetool || echo "Failed to download appimagetool"
+                    
+                    if [ -f linuxdeploy ] && [ -f appimagetool ]; then
+                      chmod +x linuxdeploy appimagetool
+                      
+                      # Build AppImage
+                      echo "Building AppImage..."
+                      if [ -n "$ICON_PATH" ]; then
+                        ./linuxdeploy --appdir dist/AppDir -d dist/AppDir/usr/share/applications/${APP}.desktop -i "$ICON_PATH" --output appimage || echo "AppImage creation failed"
+                      else
+                        ./linuxdeploy --appdir dist/AppDir -d dist/AppDir/usr/share/applications/${APP}.desktop --output appimage || echo "AppImage creation failed"
+                      fi
+                      
+                      # Move result if it exists
+                      if ls *.AppImage 1> /dev/null 2>&1; then
+                        mv *.AppImage "dist/${APP}-${{ matrix.os_tag }}.AppImage"
+                        echo "AppImage created successfully"
+                      else
+                        echo "AppImage creation failed, but tarball is available"
+                      fi
+                    else
+                      echo "Could not download AppImage tools, skipping AppImage creation"
+                    fi
+                  else
+                    echo "wget not available, skipping AppImage creation"
+                  fi
 
             - name: Package (Windows)
               if: startsWith(matrix.runner, 'windows')
@@ -185,6 +211,7 @@ jobs:
                   path: |
                       dist/${{ env.BIN_NAME }}-${{ matrix.os_tag }}.AppImage
                       dist/${{ env.BIN_NAME }}-${{ matrix.os_tag }}.tar.gz
+                  if-no-files-found: ignore
 
             - name: Upload artifacts (Windows)
               if: startsWith(matrix.runner, 'windows')
