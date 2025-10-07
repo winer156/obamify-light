@@ -126,12 +126,18 @@ jobs:
 
                   # Desktop file
                   echo "Creating desktop file..."
+                  if [ -n "$ICON_PATH" ]; then
+                    ICON_LINE="Icon=${APP}"
+                  else
+                    ICON_LINE=""
+                  fi
+
                   cat > dist/AppDir/usr/share/applications/${APP}.desktop <<DESKTOP
                   [Desktop Entry]
                   Type=Application
                   Name=${DISP}
                   Exec=${APP}
-                  Icon=${APP}
+                  ${ICON_LINE}
                   Categories=Utility;
                   Terminal=false
                   DESKTOP
@@ -155,14 +161,28 @@ jobs:
                   echo "Attempting to create AppImage..."
                   if command -v wget >/dev/null 2>&1; then
                     echo "Downloading AppImage tools..."
-                    wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" -O linuxdeploy || echo "Failed to download linuxdeploy"
-                    wget -q "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage" -O appimagetool || echo "Failed to download appimagetool"
+                    LINUXDEPLOY_SUCCESS=false
+                    APPIMAGETOOL_SUCCESS=false
                     
-                    if [ -f linuxdeploy ] && [ -f appimagetool ]; then
+                    if wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage" -O linuxdeploy; then
+                      LINUXDEPLOY_SUCCESS=true
+                      echo "linuxdeploy downloaded successfully"
+                    else
+                      echo "Failed to download linuxdeploy"
+                    fi
+                    
+                    if wget -q "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage" -O appimagetool; then
+                      APPIMAGETOOL_SUCCESS=true
+                      echo "appimagetool downloaded successfully"
+                    else
+                      echo "Failed to download appimagetool"
+                    fi
+                    
+                    if [ "$LINUXDEPLOY_SUCCESS" = true ] && [ "$APPIMAGETOOL_SUCCESS" = true ]; then
                       chmod +x linuxdeploy appimagetool
                       
                       # Build AppImage
-                      echo "Building AppImage..."
+                      echo "Building AppImage with both tools available..."
                       if [ -n "$ICON_PATH" ]; then
                         ./linuxdeploy --appdir dist/AppDir -d dist/AppDir/usr/share/applications/${APP}.desktop -i "$ICON_PATH" --output appimage || echo "AppImage creation failed"
                       else
@@ -177,7 +197,8 @@ jobs:
                         echo "AppImage creation failed, but tarball is available"
                       fi
                     else
-                      echo "Could not download AppImage tools, skipping AppImage creation"
+                      echo "Could not download both AppImage tools, skipping AppImage creation"
+                      echo "linuxdeploy: $LINUXDEPLOY_SUCCESS, appimagetool: $APPIMAGETOOL_SUCCESS"
                     fi
                   else
                     echo "wget not available, skipping AppImage creation"
