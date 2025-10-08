@@ -64,8 +64,12 @@ fn start_app() {
                     loading_text.remove();
                 }
                 Err(e) => {
-                    loading_text
-                        .set_inner_html(&format!("<p> The app has crashed. Error: {e:#?} </p>"));
+                    use web_sys::js_sys::JsString;
+
+                    loading_text.set_inner_html(&format!(
+                        "<div> Please enable WebGPU and hardware acceleration in your browser :) </div> <div class=\"error\"> Error: {} </div>",
+                        std::convert::Into::<JsString>::into(e.clone())
+                    ));
                     panic!("Failed to start eframe: {e:?}");
                 }
             }
