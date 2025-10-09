@@ -7,8 +7,10 @@ use color_quant::NeuQuant;
 use crate::{ObamifyApp, app::SeedColor};
 
 pub const GIF_FRAMERATE: u32 = 8;
-pub const GIF_RESOLUTION: u32 = 460;
-pub const GIF_NUM_FRAMES: u32 = 140;
+pub const GIF_RESOLUTION: u32 = 400;
+pub const GIF_MAX_FRAMES: u32 = 140;
+pub const GIF_MIN_FRAMES: u32 = 100;
+pub const GIF_MAX_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 pub const GIF_SPEED: f32 = 1.5;
 pub const GIF_PALETTE_SAMPLEFAC: i32 = 1;
 
@@ -38,21 +40,25 @@ struct InFlight {
 }
 
 pub struct GifRecorder {
+    pub id: u32,
     pub status: GifStatus,
     pub encoder: Option<gif::Encoder<Vec<u8>>>,
     pub palette: Option<NeuQuant>,
     pub frame_count: u32,
     inflight: Option<InFlight>,
+    should_stop: bool,
 }
 
 impl GifRecorder {
     pub fn new() -> Self {
         Self {
+            id: 0,
             status: GifStatus::None,
             encoder: None,
             palette: None,
             frame_count: 0,
             inflight: None,
+            should_stop: false,
         }
     }
 
@@ -109,6 +115,11 @@ impl GifRecorder {
                     pixels,
                     None,
                 );
+                let frame_size = encoder.get_ref().len() + frame.buffer.len() + 32; // idk if this is exact but its a conservative estimate
+                if frame_size > GIF_MAX_SIZE {
+                    self.should_stop = true;
+                    return Ok(true);
+                }
 
                 frame.delay = ((100.0 / GIF_FRAMERATE as f32) / GIF_SPEED) as u16; // delay in 1/100 sec
                 encoder.write_frame(&frame)?;
@@ -129,7 +140,10 @@ impl GifRecorder {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let colors = active_colors
             .iter()
-            .flat_map(|s| s.rgba.map(|f| (f * 256.0) as u8))
+            .flat_map(|s| {
+                s.rgba
+                    .map(|f| (if f == 1.0 { 255.0 } else { f * 256.0 }) as u8)
+            })
             .collect::<Vec<u8>>();
         let gif_palette = NeuQuant::new(GIF_PALETTE_SAMPLEFAC, 256, &colors);
         let mut encoder = gif::Encoder::new(
@@ -205,6 +219,17 @@ impl GifRecorder {
         self.palette = None;
         self.frame_count = 0;
         self.inflight = None;
+        self.id += 1;
+    }
+
+    pub fn should_stop(&self) -> bool {
+        if self.frame_count < GIF_MIN_FRAMES {
+            false
+        } else if self.frame_count >= GIF_MAX_FRAMES {
+            true
+        } else {
+            self.should_stop
+        }
     }
 }
 

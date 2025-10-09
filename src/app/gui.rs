@@ -9,7 +9,6 @@ use crate::app::calculate::util::CropScale;
 use crate::app::calculate::util::GenerationSettings;
 use crate::app::calculate::util::SourceImg;
 use crate::app::gif_recorder::GIF_FRAMERATE;
-use crate::app::gif_recorder::GIF_NUM_FRAMES;
 use crate::app::gif_recorder::GIF_RESOLUTION;
 use crate::app::gif_recorder::GifStatus;
 use crate::app::preset::Preset;
@@ -205,7 +204,7 @@ impl App for ObamifyApp {
 
                             self.gif_recorder.frame_count += 1;
 
-                            if self.gif_recorder.frame_count >= GIF_NUM_FRAMES {
+                            if self.gif_recorder.should_stop() {
                                 // finish recording
                                 if !self.gif_recorder.finish(self.sim.name()) {
                                     // cancelled
@@ -820,44 +819,47 @@ impl App for ObamifyApp {
                     });
                 });
         } else if !self.gif_recorder.not_recording() {
-            Modal::new("recording_progress".into()).show(ctx, |ui| {
-                match self.gif_recorder.status.clone() {
-                    GifStatus::Recording => {
-                        ui.label("recording gif...");
-                        if ui.button("cancel").clicked() {
-                            self.stop_recording_gif(device);
-                            self.gui.animate = false;
+            Modal::new(format!("recording_progress_{}", self.gif_recorder.id).into()).show(
+                ctx,
+                |ui| {
+                    match self.gif_recorder.status.clone() {
+                        GifStatus::Recording => {
+                            ui.label("recording gif...");
+                            if ui.button("cancel").clicked() {
+                                self.stop_recording_gif(device);
+                                self.gui.animate = false;
+                            }
                         }
-                    }
 
-                    GifStatus::Error(err) => {
-                        ui.label(format!("Error: {}", err));
-                        ui.horizontal(|ui| {
-                            if ui.button("close").clicked() {
-                                self.stop_recording_gif(device);
-                            }
-                        });
+                        GifStatus::Error(err) => {
+                            ui.label(format!("Error: {}", err));
+                            ui.horizontal(|ui| {
+                                if ui.button("close").clicked() {
+                                    self.stop_recording_gif(device);
+                                }
+                            });
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        GifStatus::Complete(path) => {
+                            ui.label("gif saved!");
+                            ui.horizontal(|ui| {
+                                if ui.button("open file").clicked() {
+                                    opener::reveal(path).ok();
+                                }
+                                if ui.button("close").clicked() {
+                                    self.stop_recording_gif(device);
+                                }
+                            });
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        GifStatus::Complete => {
+                            // save opens dialog automatically
+                            self.stop_recording_gif(device);
+                        }
+                        GifStatus::None => unreachable!(),
                     }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    GifStatus::Complete(path) => {
-                        ui.label("gif saved!");
-                        ui.horizontal(|ui| {
-                            if ui.button("open file").clicked() {
-                                opener::reveal(path).ok();
-                            }
-                            if ui.button("close").clicked() {
-                                self.stop_recording_gif(device);
-                            }
-                        });
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    GifStatus::Complete => {
-                        // save opens dialog automatically
-                        self.stop_recording_gif(device);
-                    }
-                    GifStatus::None => unreachable!(),
-                }
-            });
+                },
+            );
         }
         if let Some(err) = &self.gui.error_message {
             let mut close = false;
