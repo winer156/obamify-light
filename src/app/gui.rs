@@ -3,6 +3,7 @@ use super::DRAWING_ALPHA;
 
 use super::GuiMode;
 use super::ObamifyApp;
+use crate::app::DEFAULT_RESOLUTION;
 use crate::app::calculate;
 use crate::app::calculate::ProgressMsg;
 use crate::app::calculate::util::CropScale;
@@ -104,7 +105,6 @@ fn show_icons() {
     // show .bottom-left-icons class after processing
     if let Some(document) = web_sys::window().and_then(|w| w.document()) {
         if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
-            web_sys::console::log_1(&"showing icons".into());
             let _ = icons
                 .dyn_ref::<web_sys::HtmlElement>()
                 .map(|e| e.style().set_property("display", "flex"));
@@ -118,7 +118,6 @@ fn hide_icons() {
     // hide .bottom-left-icons class while processing
     if let Some(document) = web_sys::window().and_then(|w| w.document()) {
         if let Some(icons) = document.query_selector(".bottom-left-icons").ok().flatten() {
-            web_sys::console::log_1(&"hiding icons".into());
             let _ = icons
                 .dyn_ref::<web_sys::HtmlElement>()
                 .map(|e| e.style().set_property("display", "none"));
@@ -147,7 +146,14 @@ impl App for ObamifyApp {
         // }
 
         // Ensure texture is registered exactly once per allocation
-        self.ensure_registered_texture(rs);
+        self.ensure_registered_texture(
+            rs,
+            if self.size.0 < 512 {
+                wgpu::FilterMode::Nearest
+            } else {
+                wgpu::FilterMode::Linear
+            },
+        );
 
         #[cfg(target_arch = "wasm32")]
         self.ensure_worker(ctx);
@@ -155,12 +161,16 @@ impl App for ObamifyApp {
         // Run GPU pipeline
         if let Some(img) = &self.preview_image {
             // show image
-            let img = image::imageops::resize(
-                img,
-                self.size.0,
-                self.size.1,
-                image::imageops::FilterType::Nearest,
-            );
+            let img = if img.width() != self.size.0 || img.height() != self.size.1 {
+                &image::imageops::resize(
+                    img,
+                    self.size.0,
+                    self.size.1,
+                    image::imageops::FilterType::Nearest,
+                )
+            } else {
+                img
+            };
             let rgba: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = img.convert();
             let rgba = rgba.into_raw();
             rs.queue.write_texture(
@@ -368,7 +378,6 @@ impl App for ObamifyApp {
                                         }
                                     })
                                     .show_ui(ui, |ui| {
-                                        ui.set_max_height(300.0);
                                         let mut to_remove: Option<usize> = None;
                                         let mut close_menu = false;
 
@@ -683,12 +692,18 @@ impl App for ObamifyApp {
                                     .add(egui::Button::new(egui::RichText::new("start!").strong()))
                                     .clicked()
                                 {
-                                    if let Some((img, settings, _)) =
+                                    if let Some((img, mut settings, _)) =
                                         self.gui.configuring_generation.take()
                                     {
                                         self.gui.show_progress_modal(settings.id);
                                         //self.gui.currently_processing = Some(path.clone());
                                         //self.change_sim(device, path.clone(), false);
+
+                                        // adjust for consistency across resolutions
+                                        settings.proximity_importance =
+                                            (settings.proximity_importance as f32
+                                                / (settings.sidelen as f32 / 128.0))
+                                                as i64;
 
                                         self.gui
                                             .process_cancelled
@@ -700,6 +715,12 @@ impl App for ObamifyApp {
                                             height: img.height(),
                                             source_img: img.into_raw(),
                                         };
+
+                                        self.resize_textures(
+                                            device,
+                                            (settings.sidelen, settings.sidelen),
+                                            false,
+                                        );
 
                                         #[cfg(target_arch = "wasm32")]
                                         {
@@ -755,6 +776,11 @@ impl App for ObamifyApp {
                             match msg {
                                 ProgressMsg::Done(new_preset) => {
                                     self.preview_image = None;
+                                    self.resize_textures(
+                                        device,
+                                        (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                        false,
+                                    );
                                     //self.gui.presets = get_presets();
                                     self.gui.presets.push(new_preset.clone());
                                     self.change_sim(device, new_preset, self.gui.presets.len() - 1);
@@ -782,6 +808,11 @@ impl App for ObamifyApp {
                                 }
                                 ProgressMsg::Cancelled => {
                                     self.preview_image = None;
+                                    self.resize_textures(
+                                        device,
+                                        (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                        false,
+                                    );
                                     self.gui.hide_progress_modal();
                                     ui.close();
                                 }
@@ -809,6 +840,11 @@ impl App for ObamifyApp {
                                     }
                                     self.worker = None;
                                     self.preview_image = None;
+                                    self.resize_textures(
+                                        device,
+                                        (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                        false,
+                                    );
                                     self.gui.hide_progress_modal();
                                     ui.close();
                                 }

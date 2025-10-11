@@ -16,7 +16,7 @@ fn _debug_print(s: String) {
 
 use crate::app::calculate::util::Algorithm;
 use crate::app::{
-    calculate::util::{GenerationSettings, ProgressSink, SourceImg},
+    calculate::util::{GenerationSettings, ProgressSink},
     preset::{Preset, UnprocessedPreset},
 };
 use egui::ahash::AHasher;
@@ -248,7 +248,7 @@ pub fn process_optimal<S: ProgressSink>(
 
                 tx.send(ProgressMsg::Progress(root as f32 / nx as f32));
 
-                let img = make_new_img(
+                let data = make_new_img(
                     &source_pixels,
                     &xy.clone()
                         .into_iter()
@@ -258,9 +258,9 @@ pub fn process_optimal<S: ProgressSink>(
                 );
 
                 tx.send(ProgressMsg::UpdatePreview {
-                    width: img.width(),
-                    height: img.height(),
-                    data: img.into_raw(),
+                    width: settings.sidelen,
+                    height: settings.sidelen,
+                    data,
                 });
             }
         }
@@ -294,16 +294,14 @@ pub fn process_optimal<S: ProgressSink>(
     Ok(())
 }
 
-fn make_new_img(source_pixels: &[(u8, u8, u8)], assignments: &[usize], sidelen: u32) -> SourceImg {
-    let mut img = SourceImg::new(sidelen, sidelen);
-
+fn make_new_img(source_pixels: &[(u8, u8, u8)], assignments: &[usize], sidelen: u32) -> Vec<u8> {
+    let mut img = vec![0; (sidelen * sidelen * 3) as usize];
     for (target_idx, source_idx) in assignments.iter().enumerate() {
-        let (x, y) = (
-            (target_idx % sidelen as usize) as u32,
-            (target_idx / sidelen as usize) as u32,
-        );
         let (r, g, b) = source_pixels[*source_idx];
-        img.put_pixel(x, y, image::Rgb([r, g, b]));
+        let base = target_idx * 3;
+        img[base] = r;
+        img[base + 1] = g;
+        img[base + 2] = b;
     }
     img
 }
@@ -349,11 +347,7 @@ impl Pixel {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-const SWAPS_PER_GENERATION_PER_PIXEL: usize = 20;
-
-#[cfg(target_arch = "wasm32")]
-const SWAPS_PER_GENERATION_PER_PIXEL: usize = 100; // for some reason wasm is like 5x faster
+const SWAPS_PER_GENERATION_PER_PIXEL: usize = 128;
 
 pub fn process_genetic<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
@@ -462,11 +456,11 @@ pub fn process_genetic<S: ProgressSink>(
             }));
             return Ok(());
         }
-        let img = make_new_img(&source_pixels, &assignments, settings.sidelen);
+        let data = make_new_img(&source_pixels, &assignments, settings.sidelen);
         tx.send(ProgressMsg::UpdatePreview {
-            width: img.width(),
-            height: img.height(),
-            data: img.into_raw(),
+            width: settings.sidelen,
+            height: settings.sidelen,
+            data,
         });
         tx.send(ProgressMsg::Progress(
             1.0 - max_dist as f32 / settings.sidelen as f32,

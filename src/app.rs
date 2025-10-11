@@ -154,6 +154,7 @@ pub struct ObamifyApp {
     gui: gui::GuiState,
     #[cfg(not(target_arch = "wasm32"))]
     current_drawing_id: Arc<AtomicU32>,
+    current_filter_mode: wgpu::FilterMode,
 }
 
 impl ObamifyApp {
@@ -685,6 +686,7 @@ impl ObamifyApp {
             worker: None,
             #[cfg(target_arch = "wasm32")]
             inbox: Vec::new(),
+            current_filter_mode: wgpu::FilterMode::Linear,
         }
     }
 
@@ -849,14 +851,19 @@ impl ObamifyApp {
         (tex, view)
     }
 
-    fn ensure_registered_texture(&mut self, rs: &egui_wgpu::RenderState) {
-        if self.egui_tex_id.is_none() {
+    fn ensure_registered_texture(
+        &mut self,
+        rs: &egui_wgpu::RenderState,
+        filter_mode: wgpu::FilterMode,
+    ) {
+        if self.egui_tex_id.is_none() || self.current_filter_mode != filter_mode {
             let id = rs.renderer.write().register_native_texture(
                 &rs.device,
                 &self.color_view,
-                wgpu::FilterMode::Linear,
+                filter_mode,
             );
             self.egui_tex_id = Some(id);
+            self.current_filter_mode = filter_mode;
         }
     }
 
