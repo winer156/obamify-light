@@ -24,8 +24,6 @@ use egui_wgpu::{self, wgpu};
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 
-const WG_SIZE_XY: u32 = 8;
-const WG_SIZE_SEEDS: u32 = 256;
 //const INVALID_ID: u32 = 0xFFFF_FFFF;
 
 #[repr(C)]
@@ -117,26 +115,34 @@ pub struct ObamifyApp {
     params_jfa_buf: wgpu::Buffer,
 
     // Textures & views
+    seed_tex: wgpu::Texture, // Seed positions as texture (WebGL compatible)
+    seed_tex_view: wgpu::TextureView,
+    color_lookup_tex: wgpu::Texture, // Color lookup table as texture (WebGL compatible)
+    color_lookup_tex_view: wgpu::TextureView,
+
     ids_a: wgpu::Texture,
     ids_b: wgpu::Texture,
     ids_a_view: wgpu::TextureView,
     ids_b_view: wgpu::TextureView,
 
-    // Color (linear storage + srgb view for egui)
+    // Color (linear storage + srgb view for egui - render target)
     color_tex: wgpu::Texture,
     color_view: wgpu::TextureView,
 
     // Pipelines
-    clear_pipeline: wgpu::ComputePipeline,
-    seed_splat_pipeline: wgpu::ComputePipeline,
-    jfa_pipeline: wgpu::ComputePipeline,
-    shade_pipeline: wgpu::ComputePipeline,
+    clear_pipeline: wgpu::RenderPipeline,
+    seed_splat_pipeline: wgpu::RenderPipeline,
+    jfa_pipeline: wgpu::RenderPipeline,
+    shade_pipeline: wgpu::RenderPipeline,
 
     // Bind group layouts
     clear_bgl: wgpu::BindGroupLayout,
     seed_bgl: wgpu::BindGroupLayout,
     jfa_bgl: wgpu::BindGroupLayout,
     shade_bgl: wgpu::BindGroupLayout,
+
+    // Sampler for texture reads
+    nearest_sampler: wgpu::Sampler,
 
     // Bind groups that are re-created when textures change
     clear_bg_a: wgpu::BindGroup,
@@ -161,6 +167,7 @@ impl ObamifyApp {
     fn apply_sim_init(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         seed_count: u32,
         seeds: Vec<SeedPos>,
         colors: Vec<SeedColor>,
@@ -176,6 +183,12 @@ impl ObamifyApp {
             contents: bytemuck::cast_slice(&self.seeds),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+
+        // Update seed texture (WebGL compatible)
+        let (seed_tex, seed_tex_view) =
+            Self::make_seed_texture(device, queue, &self.seeds, self.seed_count);
+        self.seed_tex = seed_tex;
+        self.seed_tex_view = seed_tex_view;
 
         let params_common = ParamsCommon {
             width: self.size.0,
@@ -195,6 +208,12 @@ impl ObamifyApp {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Update color lookup texture (WebGL compatible)
+        let (color_lookup_tex, color_lookup_tex_view) =
+            Self::make_color_lookup_texture(device, queue, &colors, self.seed_count);
+        self.color_lookup_tex = color_lookup_tex;
+        self.color_lookup_tex_view = color_lookup_tex_view;
+
         *self.colors.write().unwrap() = colors;
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -205,16 +224,27 @@ impl ObamifyApp {
         self.rebuild_bind_groups(device);
     }
 
-    pub fn change_sim(&mut self, device: &wgpu::Device, source: Preset, change_index: usize) {
+    pub fn change_sim(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: Preset,
+        change_index: usize,
+    ) {
         let (seed_count, seeds, colors, sim) = morph_sim::init_image(self.size.0, source);
-        self.apply_sim_init(device, seed_count, seeds, colors, sim);
+        self.apply_sim_init(device, queue, seed_count, seeds, colors, sim);
         self.gui.current_preset = change_index;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn canvas_sim(&mut self, device: &wgpu::Device, source: &UnprocessedPreset) {
+    pub fn canvas_sim(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &UnprocessedPreset,
+    ) {
         let (seed_count, seeds, colors, sim) = morph_sim::init_canvas(self.size.0, source.clone());
-        self.apply_sim_init(device, seed_count, seeds, colors, sim);
+        self.apply_sim_init(device, queue, seed_count, seeds, colors, sim);
     }
 
     pub fn new(cc: &CreationContext<'_>) -> Self {
@@ -259,6 +289,12 @@ impl ObamifyApp {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Create textures for WebGL compatibility (no storage buffers in shaders)
+        let (seed_tex, seed_tex_view) =
+            Self::make_seed_texture(device, &rs.queue, &seeds, seed_count);
+        let (color_lookup_tex, color_lookup_tex_view) =
+            Self::make_color_lookup_texture(device, &rs.queue, &colors, seed_count);
+
         let params_common = ParamsCommon {
             width: size.0,
             height: size.1,
@@ -291,36 +327,27 @@ impl ObamifyApp {
         // === Pipelines ===
         let clear_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_clear"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::R32Uint,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            }],
+            entries: &[],
         });
 
         let seed_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_seed_splat"),
             entries: &[
-                // seeds
+                // seed positions texture (WebGL compatible)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
                 // params common
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -330,60 +357,45 @@ impl ObamifyApp {
                     },
                     count: None,
                 },
-                // dst ids
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
             ],
         });
 
         let jfa_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_jfa"),
             entries: &[
-                // seeds
+                // seed positions texture (WebGL compatible)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // src ids (read-only sampled as integer texture)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
                 },
-                // dst ids (write-only)
+                // src ids texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // src ids sampler
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Uint,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
                 // params_jfa
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -397,51 +409,72 @@ impl ObamifyApp {
         let shade_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bgl_shade"),
             entries: &[
-                // ids texture (u32)
+                // ids texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
                 },
-                // out color (rgba8unorm)
+                // ids sampler
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
-                // seeds (read-only)
+                // seed positions texture (WebGL compatible)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
-                // colors
+                // colors texture (WebGL compatible)
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // params common
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        min_binding_size: NonZeroU64::new(
+                            std::mem::size_of::<ParamsCommon>() as u64
+                        ),
                     },
                     count: None,
                 },
             ],
+        });
+
+        // Sampler for texture reads
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nearest_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
         });
 
         // Shader modules
@@ -463,7 +496,7 @@ impl ObamifyApp {
         });
 
         // Pipelines
-        let clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("clear_pipeline"),
             layout: Some(
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -472,29 +505,68 @@ impl ObamifyApp {
                     push_constant_ranges: &[],
                 }),
             ),
-            module: &clear_sm,
-            entry_point: Some("main"),
+            vertex: wgpu::VertexState {
+                module: &clear_sm,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &clear_sm,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
             cache: None,
-            compilation_options: Default::default(),
         });
 
-        let seed_splat_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("seed_splat_pipeline"),
-                layout: Some(
-                    &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("pl_seed"),
-                        bind_group_layouts: &[&seed_bgl],
-                        push_constant_ranges: &[],
-                    }),
-                ),
+        let seed_splat_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("seed_splat_pipeline"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("pl_seed"),
+                    bind_group_layouts: &[&seed_bgl],
+                    push_constant_ranges: &[],
+                }),
+            ),
+            vertex: wgpu::VertexState {
                 module: &seed_sm,
-                entry_point: Some("main"),
-                cache: None,
+                entry_point: Some("vs_main"),
+                buffers: &[],
                 compilation_options: Default::default(),
-            });
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &seed_sm,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::PointList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
-        let jfa_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let jfa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("jfa_pipeline"),
             layout: Some(
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -503,13 +575,33 @@ impl ObamifyApp {
                     push_constant_ranges: &[],
                 }),
             ),
-            module: &jfa_sm,
-            entry_point: Some("main"),
+            vertex: wgpu::VertexState {
+                module: &jfa_sm,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &jfa_sm,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
             cache: None,
-            compilation_options: Default::default(),
         });
 
-        let shade_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let shade_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("shade_pipeline"),
             layout: Some(
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -518,28 +610,42 @@ impl ObamifyApp {
                     push_constant_ranges: &[],
                 }),
             ),
-            module: &shade_sm,
-            entry_point: Some("main"),
+            vertex: wgpu::VertexState {
+                module: &shade_sm,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shade_sm,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
             cache: None,
-            compilation_options: Default::default(),
         });
 
         // Bind groups
         let clear_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_clear_a"),
             layout: &clear_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&ids_a_view),
-            }],
+            entries: &[],
         });
         let clear_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_clear_b"),
             layout: &clear_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&ids_b_view),
-            }],
+            entries: &[],
         });
 
         let seed_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -548,15 +654,11 @@ impl ObamifyApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: params_common_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&ids_a_view),
                 },
             ],
         });
@@ -567,7 +669,7 @@ impl ObamifyApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -575,7 +677,7 @@ impl ObamifyApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&ids_b_view),
+                    resource: wgpu::BindingResource::Sampler(&nearest_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -590,7 +692,7 @@ impl ObamifyApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -598,7 +700,7 @@ impl ObamifyApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&ids_a_view),
+                    resource: wgpu::BindingResource::Sampler(&nearest_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -617,15 +719,19 @@ impl ObamifyApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&color_view),
+                    resource: wgpu::BindingResource::Sampler(&nearest_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: color_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&color_lookup_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_common_buf.as_entire_binding(),
                 },
             ],
         });
@@ -649,6 +755,10 @@ impl ObamifyApp {
             sim,
             params_common_buf,
             params_jfa_buf,
+            seed_tex,
+            seed_tex_view,
+            color_lookup_tex,
+            color_lookup_tex_view,
             ids_a,
             ids_b,
             ids_a_view,
@@ -663,6 +773,7 @@ impl ObamifyApp {
             seed_bgl,
             jfa_bgl,
             shade_bgl,
+            nearest_sampler,
             clear_bg_a,
             clear_bg_b,
             seed_bg,
@@ -715,9 +826,38 @@ impl ObamifyApp {
         }
 
         let worker = {
+            let wasm_script_src = js_sys::Reflect::get(
+                &js_sys::global(),
+                &JsValue::from_str("__wbindgen_script_src"),
+            )
+            .ok()
+            .and_then(|v| v.as_string())
+            .and_then(|url| url.rsplit('/').next().map(|s| format!("./{}", s)))
+            .unwrap_or_else(|| {
+                // Fallback: parse from Error stack trace to find obamify-{hash}.js
+                let error = js_sys::Error::new("stack trace");
+                if let Ok(stack_val) = js_sys::Reflect::get(&error, &JsValue::from_str("stack")) {
+                    if let Some(stack) = stack_val.as_string() {
+                        // Look for obamify-{hash}.js in the stack
+                        if let Some(start) = stack.find("obamify-") {
+                            let rest = &stack[start..];
+                            if let Some(end) = rest.find(".js") {
+                                let filename = &rest[..end + 3];
+                                return format!("./{}", filename);
+                            }
+                        }
+                    }
+                }
+
+                String::from("./obamify.js")
+            });
+
+            // Use worker.js and pass the script name as a query parameter
+            let worker_url = format!("./worker.js?script={}", wasm_script_src);
+
             let opts = WorkerOptions::new();
             opts.set_type(WorkerType::Module);
-            let w = Worker::new_with_options("worker.js", &opts).expect("worker");
+            let w = Worker::new_with_options(&worker_url, &opts).expect("worker");
 
             // ---- onerror: may be ErrorEvent OR a generic Event/JsValue ----
             let onerror = Closure::wrap(Box::new(move |e: JsValue| {
@@ -807,13 +947,13 @@ impl ObamifyApp {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor {
             label: Some("ids_view"),
-            format: Some(wgpu::TextureFormat::R32Uint),
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
             dimension: Some(wgpu::TextureViewDimension::D2),
             aspect: wgpu::TextureAspect::All,
             base_mip_level: 0,
@@ -841,12 +981,159 @@ impl ObamifyApp {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    fn make_seed_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        seeds: &[SeedPos],
+        max_seeds: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        // Pack seeds into a 2D texture to respect WebGL texture size limits (typically 2048-4096)
+        // Use a square-ish layout: width = 1024, height = ceil(max_seeds / 1024)
+        const TEX_WIDTH: u32 = 1024;
+        let tex_height = max_seeds.div_ceil(TEX_WIDTH);
+
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("seed_positions"),
+            size: wgpu::Extent3d {
+                width: TEX_WIDTH,
+                height: tex_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg32Float, // Store x,y as 2 floats
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload seed data to texture (packed in 2D)
+        let mut data = vec![0.0f32; (TEX_WIDTH * tex_height * 2) as usize];
+        for (i, seed) in seeds.iter().enumerate() {
+            data[i * 2] = seed.xy[0];
+            data[i * 2 + 1] = seed.xy[1];
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEX_WIDTH * 8), // 2 floats * 4 bytes per pixel
+                rows_per_image: Some(tex_height),
+            },
+            wgpu::Extent3d {
+                width: TEX_WIDTH,
+                height: tex_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    fn update_seed_texture_data(&self, queue: &wgpu::Queue, seeds: &[SeedPos]) {
+        // Update seed texture data without recreating the texture
+        const TEX_WIDTH: u32 = 1024;
+        let tex_height = self.seed_count.div_ceil(TEX_WIDTH);
+
+        let mut data = vec![0.0f32; (TEX_WIDTH * tex_height * 2) as usize];
+        for (i, seed) in seeds.iter().enumerate() {
+            data[i * 2] = seed.xy[0];
+            data[i * 2 + 1] = seed.xy[1];
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.seed_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEX_WIDTH * 8), // 2 floats * 4 bytes per pixel
+                rows_per_image: Some(tex_height),
+            },
+            wgpu::Extent3d {
+                width: TEX_WIDTH,
+                height: tex_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn make_color_lookup_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        colors: &[SeedColor],
+        max_seeds: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        // Pack colors into a 2D texture to respect WebGL texture size limits
+        const TEX_WIDTH: u32 = 1024;
+        let tex_height = max_seeds.div_ceil(TEX_WIDTH);
+
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("color_lookup"),
+            size: wgpu::Extent3d {
+                width: TEX_WIDTH,
+                height: tex_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float, // Store RGBA as 4 floats
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload color data to texture (packed in 2D)
+        let mut data = vec![0.0f32; (TEX_WIDTH * tex_height * 4) as usize];
+        for (i, color) in colors.iter().enumerate() {
+            data[i * 4] = color.rgba[0];
+            data[i * 4 + 1] = color.rgba[1];
+            data[i * 4 + 2] = color.rgba[2];
+            data[i * 4 + 3] = color.rgba[3];
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEX_WIDTH * 16), // 4 floats * 4 bytes per pixel
+                rows_per_image: Some(tex_height),
+            },
+            wgpu::Extent3d {
+                width: TEX_WIDTH,
+                height: tex_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         (tex, view)
     }
@@ -872,18 +1159,12 @@ impl ObamifyApp {
         self.clear_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_clear_a"),
             layout: &self.clear_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&self.ids_a_view),
-            }],
+            entries: &[],
         });
         self.clear_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_clear_b"),
             layout: &self.clear_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
-            }],
+            entries: &[],
         });
         self.seed_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bg_seed_splat"),
@@ -891,15 +1172,11 @@ impl ObamifyApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.params_common_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.ids_a_view),
                 },
             ],
         });
@@ -909,7 +1186,7 @@ impl ObamifyApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -917,7 +1194,7 @@ impl ObamifyApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.ids_b_view),
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -931,7 +1208,7 @@ impl ObamifyApp {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -939,7 +1216,7 @@ impl ObamifyApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&self.ids_a_view),
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -957,15 +1234,19 @@ impl ObamifyApp {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.color_view),
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.seed_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.color_buf.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&self.color_lookup_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.params_common_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1025,31 +1306,46 @@ impl ObamifyApp {
             label: Some("voronoi_jfa_encoder"),
         });
 
-        // 1) Clear both ID textures
-        for bg in [&self.clear_bg_a, &self.clear_bg_b] {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        // 1) Clear ID texture A (where we'll splat seeds)
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear_ids_a"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.ids_a_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
+                occlusion_query_set: None,
             });
-            cpass.set_pipeline(&self.clear_pipeline);
-            cpass.set_bind_group(0, bg, &[]);
-            cpass.dispatch_workgroups(
-                self.size.0.div_ceil(WG_SIZE_XY),
-                self.size.1.div_ceil(WG_SIZE_XY),
-                1,
-            );
+            rpass.set_pipeline(&self.clear_pipeline);
+            rpass.set_bind_group(0, &self.clear_bg_a, &[]);
+            rpass.draw(0..4, 0..1);
         }
 
         // 2) Seed splat into A
         {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("seed_splat"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.ids_a_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
+                occlusion_query_set: None,
             });
-            cpass.set_pipeline(&self.seed_splat_pipeline);
-            cpass.set_bind_group(0, &self.seed_bg, &[]);
-            cpass.dispatch_workgroups(self.seed_count.div_ceil(WG_SIZE_SEEDS), 1, 1);
-            //
+            rpass.set_pipeline(&self.seed_splat_pipeline);
+            rpass.set_bind_group(0, &self.seed_bg, &[]);
+            rpass.draw(0..self.seed_count, 0..1);
         }
 
         // 3) JFA passes, ping-pong A<->B
@@ -1061,10 +1357,8 @@ impl ObamifyApp {
         }
         step >>= 1;
 
-        let groups_x = self.size.0.div_ceil(WG_SIZE_XY);
-        let groups_y = self.size.1.div_ceil(WG_SIZE_XY);
-
         let mut flip = false;
+        let mut is_first_jfa_pass = true;
         while step >= 1 {
             let pj = ParamsJfa {
                 width: self.size.0,
@@ -1085,12 +1379,33 @@ impl ObamifyApp {
                 std::mem::size_of::<ParamsJfa>() as u64,
             );
             {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                // On first pass writing to B, clear it. After that, always load previous content.
+                let load_op = if is_first_jfa_pass && !flip {
+                    wgpu::LoadOp::Clear(wgpu::Color::WHITE)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("jfa_step"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: if !flip {
+                            &self.ids_b_view
+                        } else {
+                            &self.ids_a_view
+                        },
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: load_op,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
                     timestamp_writes: None,
+                    occlusion_query_set: None,
                 });
-                cpass.set_pipeline(&self.jfa_pipeline);
-                cpass.set_bind_group(
+                rpass.set_pipeline(&self.jfa_pipeline);
+                rpass.set_bind_group(
                     0,
                     if !flip {
                         &self.jfa_bg_a_to_b
@@ -1099,8 +1414,9 @@ impl ObamifyApp {
                     },
                     &[],
                 );
-                cpass.dispatch_workgroups(groups_x, groups_y, 1);
+                rpass.draw(0..4, 0..1);
             }
+            is_first_jfa_pass = false;
             flip = !flip;
             step >>= 1;
         }
@@ -1161,49 +1477,74 @@ impl ObamifyApp {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&self.color_view),
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: self.seed_buf.as_entire_binding(),
+                        resource: wgpu::BindingResource::TextureView(&self.seed_tex_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: self.color_buf.as_entire_binding(),
+                        resource: wgpu::BindingResource::TextureView(&self.color_lookup_tex_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.params_common_buf.as_entire_binding(),
                     },
                 ],
             });
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shade"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
+                occlusion_query_set: None,
             });
-            cpass.set_pipeline(&self.shade_pipeline);
-            cpass.set_bind_group(0, &tmp_bg, &[]);
-            cpass.dispatch_workgroups(groups_x, groups_y, 1);
+            rpass.set_pipeline(&self.shade_pipeline);
+            rpass.set_bind_group(0, &tmp_bg, &[]);
+            rpass.draw(0..4, 0..1);
         } else {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shade"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
                 timestamp_writes: None,
+                occlusion_query_set: None,
             });
-            cpass.set_pipeline(&self.shade_pipeline);
-            cpass.set_bind_group(0, &self.shade_bg, &[]);
-            cpass.dispatch_workgroups(groups_x, groups_y, 1);
+            rpass.set_pipeline(&self.shade_pipeline);
+            rpass.set_bind_group(0, &self.shade_bg, &[]);
+            rpass.draw(0..4, 0..1);
         }
 
         // Submit
         rs.queue.submit(std::iter::once(encoder.finish()));
     }
 
-    fn stop_recording_gif(&mut self, device: &wgpu::Device) {
+    fn stop_recording_gif(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.gif_recorder.stop();
         self.gui.animate = false;
         self.resize_textures(device, (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION), false);
-        self.reset_sim(device);
+        self.reset_sim(device, queue);
     }
 
-    fn reset_sim(&mut self, device: &wgpu::Device) {
+    fn reset_sim(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.change_sim(
             device,
+            queue,
             self.gui.presets[self.gui.current_preset].clone(),
             self.gui.current_preset,
         );
@@ -1215,6 +1556,7 @@ impl ObamifyApp {
         last_mouse_pos: Option<(f32, f32)>,
         mousepos: (f32, f32),
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
     ) {
         let stroke_id = if last_mouse_pos.is_some() {
             self.stroke_count
@@ -1268,9 +1610,43 @@ impl ObamifyApp {
             }
         }
 
+        // Update the color lookup texture with modified colors
+        const TEX_WIDTH: u32 = 1024;
+        let tex_height = self.seed_count.div_ceil(TEX_WIDTH);
+
+        let colors = self.colors.read().unwrap();
+        let mut data = vec![0.0f32; (TEX_WIDTH * tex_height * 4) as usize];
+        for (i, color) in colors.iter().enumerate() {
+            data[i * 4] = color.rgba[0];
+            data[i * 4 + 1] = color.rgba[1];
+            data[i * 4 + 2] = color.rgba[2];
+            data[i * 4 + 3] = color.rgba[3];
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.color_lookup_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEX_WIDTH * 16), // 4 floats * 4 bytes per pixel
+                rows_per_image: Some(tex_height),
+            },
+            wgpu::Extent3d {
+                width: TEX_WIDTH,
+                height: tex_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Keep the buffer for backward compatibility if needed elsewhere
         self.color_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("colors"),
-            contents: bytemuck::cast_slice(&self.colors.read().unwrap()),
+            contents: bytemuck::cast_slice(&*colors),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
     }
@@ -1280,6 +1656,7 @@ impl ObamifyApp {
         &mut self,
         ctx: &egui::Context,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         ui: &mut egui::Ui,
         aspect: f32,
     ) {
@@ -1301,7 +1678,7 @@ impl ObamifyApp {
                     && img_y < self.size.1 as f32
                     && ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary))
                 {
-                    self.draw(self.gui.last_mouse_pos, (img_x, img_y), device);
+                    self.draw(self.gui.last_mouse_pos, (img_x, img_y), device, queue);
                     self.gui.last_mouse_pos = Some((img_x, img_y));
                 } else {
                     self.gui.last_mouse_pos = None;
@@ -1315,7 +1692,7 @@ impl ObamifyApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn init_canvas(&mut self, device: &wgpu::Device) {
+    fn init_canvas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let blank = image::load_from_memory(include_bytes!("./app/calculate/blank.png"))
             .unwrap()
             .to_rgba8();
@@ -1327,7 +1704,7 @@ impl ObamifyApp {
             height: blank.height(),
             source_img: blank.into_raw(),
         };
-        self.canvas_sim(device, &source);
+        self.canvas_sim(device, queue, &source);
         self.gui.animate = true;
 
         self.current_drawing_id

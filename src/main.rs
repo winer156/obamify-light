@@ -35,7 +35,33 @@ fn start_app() {
     // Redirect `log` message to `console.log` and friends:
     eframe::WebLogger::init(log::LevelFilter::Warn).ok();
 
-    let web_options = eframe::WebOptions::default();
+    let web_options = eframe::WebOptions {
+        wgpu_options: egui_wgpu::WgpuConfiguration {
+            // Force WebGL backend for maximum compatibility
+            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(egui_wgpu::WgpuSetupCreateNew {
+                instance_descriptor: egui_wgpu::wgpu::InstanceDescriptor {
+                    backends: egui_wgpu::wgpu::Backends::GL,
+                    ..Default::default()
+                },
+                power_preference: egui_wgpu::wgpu::PowerPreference::HighPerformance,
+                device_descriptor: std::sync::Arc::new(|_adapter| {
+                    let mut limits = egui_wgpu::wgpu::Limits::downlevel_webgl2_defaults();
+                    // Clamp texture size to 2048 for WebGL compatibility
+                    limits.max_texture_dimension_2d = 4096;
+                    egui_wgpu::wgpu::DeviceDescriptor {
+                        label: Some("egui_device"),
+                        required_features: egui_wgpu::wgpu::Features::default(),
+                        required_limits: limits,
+                        memory_hints: egui_wgpu::wgpu::MemoryHints::default(),
+                        trace: Default::default(),
+                    }
+                }),
+                native_adapter_selector: None,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     wasm_bindgen_futures::spawn_local(async {
         let document = web_sys::window()
@@ -67,7 +93,7 @@ fn start_app() {
                     use web_sys::js_sys::JsString;
 
                     loading_text.set_inner_html(&format!(
-                        "<div> Please enable WebGPU and hardware acceleration in your browser :) </div> <div class=\"error\"> Error: {} </div>",
+                        "<div> Please enable hardware acceleration in your browser :) </div> <div class=\"error\"> Error: {} </div>",
                         std::convert::Into::<JsString>::into(e.clone())
                     ));
                     panic!("Failed to start eframe: {e:?}");

@@ -1,17 +1,42 @@
-struct Seeds { pos: array<vec2<f32>> };
-@group(0) @binding(0) var<storage, read> seeds: Seeds;
+@group(0) @binding(0) var seed_tex: texture_2d<f32>;
 
 struct ParamsCommon { width: u32, height: u32, n_seeds: u32, _pad: u32 };
 @group(0) @binding(1) var<uniform> params: ParamsCommon;
 
-@group(0) @binding(2) var dst_ids: texture_storage_2d<r32uint, write>;
+struct VertexOutput {
+  @builtin(position) position: vec4<f32>,
+  @location(0) seed_id: u32,
+};
 
-@compute @workgroup_size(256,1,1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= params.n_seeds) { return; }
-  let p = seeds.pos[i];
-  let x = i32(round(p.x));
-  let y = i32(round(p.y));
-  textureStore(dst_ids, vec2<i32>(x,y), vec4<u32>(i, 0u, 0u, 0u));
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+  var output: VertexOutput;
+  let seed_id = vertex_index;
+  
+  if (seed_id >= params.n_seeds) {
+    output.position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    output.seed_id = 0u;
+    return output;
+  }
+  
+  let tex_width = 1024u;
+  let seed_x = seed_id % tex_width;
+  let seed_y = seed_id / tex_width;
+  let seed_uv = vec2<i32>(i32(seed_x), i32(seed_y));
+  let p = textureLoad(seed_tex, seed_uv, 0).rg;
+  
+  let x = ((p.x + 0.5) / f32(params.width)) * 2.0 - 1.0;
+  let y = ((p.y + 0.5) / f32(params.height)) * 2.0 - 1.0;
+  output.position = vec4<f32>(x, -y, 0.0, 1.0);
+  output.seed_id = seed_id;
+  return output;
+}
+
+@fragment
+fn fs_main(@location(0) seed_id: u32) -> @location(0) vec4<f32> {
+  let r = f32((seed_id >> 0u) & 0xFFu) / 255.0;
+  let g = f32((seed_id >> 8u) & 0xFFu) / 255.0;
+  let b = f32((seed_id >> 16u) & 0xFFu) / 255.0;
+  let a = f32((seed_id >> 24u) & 0xFFu) / 255.0;
+  return vec4<f32>(r, g, b, a);
 }

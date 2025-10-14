@@ -218,7 +218,7 @@ impl App for ObamifyApp {
                                 // finish recording
                                 if !self.gif_recorder.finish(self.sim.name()) {
                                     // cancelled
-                                    self.stop_recording_gif(device);
+                                    self.stop_recording_gif(device, &rs.queue);
                                 }
 
                                 self.gui.animate = false;
@@ -237,6 +237,8 @@ impl App for ObamifyApp {
                 }
                 rs.queue
                     .write_buffer(&self.seed_buf, 0, bytemuck::cast_slice(&self.seeds));
+                // Update seed texture for WebGL compatibility
+                self.update_seed_texture_data(&rs.queue, &self.seeds);
             }
         }
 
@@ -268,7 +270,7 @@ impl App for ObamifyApp {
                         #[cfg(not(target_arch = "wasm32"))]
                         GuiMode::Draw => {
                             if ui.button("reset").clicked() {
-                                self.init_canvas(device);
+                                self.init_canvas(device, &rs.queue);
                             }
 
                             while let Some(msg) = self.get_latest_msg() {
@@ -303,7 +305,7 @@ impl App for ObamifyApp {
                                 .clicked()
                             {
                                 self.gui.mode = GuiMode::Transform;
-                                self.change_sim(device, self.gui.presets[0].clone(), 0);
+                                self.change_sim(device, &rs.queue, self.gui.presets[0].clone(), 0);
                             }
                         }
 
@@ -328,7 +330,7 @@ impl App for ObamifyApp {
                                     self.sim.switch();
                                 }
                                 if ui.button("reload").clicked() {
-                                    self.reset_sim(device);
+                                    self.reset_sim(device, &rs.queue);
                                     self.gui.animate = false;
                                 }
                             });
@@ -348,7 +350,7 @@ impl App for ObamifyApp {
                                         (GIF_RESOLUTION, GIF_RESOLUTION),
                                         false,
                                     );
-                                    self.reset_sim(device);
+                                    self.reset_sim(device, &rs.queue);
                                     self.gui.animate = true;
                                     for _ in 0..20 {
                                         self.sim.update(&mut self.seeds, self.size.0);
@@ -428,7 +430,12 @@ impl App for ObamifyApp {
                                                 {
                                                     to_remove = Some(i);
                                                 } else if preset_resp.clicked() {
-                                                    self.change_sim(device, preset.clone(), i);
+                                                    self.change_sim(
+                                                        device,
+                                                        &rs.queue,
+                                                        preset.clone(),
+                                                        i,
+                                                    );
                                                     self.gui.animate = false;
                                                     self.gui.current_preset = i;
                                                     close_menu = true;
@@ -443,6 +450,7 @@ impl App for ObamifyApp {
                                                 let new_index = idx.min(self.gui.presets.len() - 1);
                                                 self.change_sim(
                                                     device,
+                                                    &rs.queue,
                                                     self.gui.presets[new_index].clone(),
                                                     new_index,
                                                 );
@@ -485,7 +493,7 @@ impl App for ObamifyApp {
                                 #[cfg(not(target_arch = "wasm32"))]
                                 {
                                     self.gui.mode = GuiMode::Draw;
-                                    self.init_canvas(device);
+                                    self.init_canvas(device, &rs.queue);
                                 }
 
                                 #[cfg(target_arch = "wasm32")]
@@ -783,7 +791,12 @@ impl App for ObamifyApp {
                                     );
                                     //self.gui.presets = get_presets();
                                     self.gui.presets.push(new_preset.clone());
-                                    self.change_sim(device, new_preset, self.gui.presets.len() - 1);
+                                    self.change_sim(
+                                        device,
+                                        &rs.queue,
+                                        new_preset,
+                                        self.gui.presets.len() - 1,
+                                    );
                                     self.gui.animate = true;
                                     self.gui.hide_progress_modal();
                                     ui.close();
@@ -862,7 +875,7 @@ impl App for ObamifyApp {
                         GifStatus::Recording => {
                             ui.label("recording gif...");
                             if ui.button("cancel").clicked() {
-                                self.stop_recording_gif(device);
+                                self.stop_recording_gif(device, &rs.queue);
                                 self.gui.animate = false;
                             }
                         }
@@ -871,7 +884,7 @@ impl App for ObamifyApp {
                             ui.label(format!("Error: {}", err));
                             ui.horizontal(|ui| {
                                 if ui.button("close").clicked() {
-                                    self.stop_recording_gif(device);
+                                    self.stop_recording_gif(device, &rs.queue);
                                 }
                             });
                         }
@@ -883,14 +896,14 @@ impl App for ObamifyApp {
                                     opener::reveal(path).ok();
                                 }
                                 if ui.button("close").clicked() {
-                                    self.stop_recording_gif(device);
+                                    self.stop_recording_gif(device, &rs.queue);
                                 }
                             });
                         }
                         #[cfg(target_arch = "wasm32")]
                         GifStatus::Complete => {
                             // save opens dialog automatically
-                            self.stop_recording_gif(device);
+                            self.stop_recording_gif(device, &rs.queue);
                         }
                         GifStatus::None => unreachable!(),
                     }
@@ -928,7 +941,7 @@ impl App for ObamifyApp {
 
                             #[cfg(not(target_arch = "wasm32"))]
                             if matches!(self.gui.mode, GuiMode::Draw) {
-                                self.handle_drawing(ctx, device, ui, aspect);
+                                self.handle_drawing(ctx, device, &rs.queue, ui, aspect);
                             }
                         } else {
                             ui.colored_label(Color32::LIGHT_RED, "Texture not ready");
