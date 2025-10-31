@@ -1,5 +1,5 @@
 [package]
-name = "obamify"
+name = "obamify light"
 version = "0.3.0"
 authors = ["Spu7Nix"]
 edition = "2024"
@@ -54,19 +54,13 @@ wasm-bindgen-futures = "0.4.50"
 web-sys = { version = "0.3.70", features = [
   "DedicatedWorkerGlobalScope", "Worker", "WorkerOptions", "WorkerType", "MessageEvent", "ErrorEvent",
   "HtmlScriptElement", "HtmlCollection", "Element", "NodeList", "Blob", "BlobPropertyBag", "Url", "Window", "Document",
-] }             # to access the DOM (to hide the loading text)
-# gloo = { version = "0.11.0", features = ["futures"] }
+] }
 serde-wasm-bindgen = "0.6"
 futures = "0.3.31"
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1.7"
-
-# Override wgpu for WASM to use only WebGL backend
 wgpu = { version = "25.0", features = ["webgl"] }
-
 [profile.release]
-opt-level = 3 # fast and small wasm
-
-# Optimize all dependencies even in debug builds:
+opt-level = 3 
 [profile.dev.package."*"]
 opt-level = 2
