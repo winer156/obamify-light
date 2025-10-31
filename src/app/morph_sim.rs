@@ -7,7 +7,6 @@ use crate::app::{SeedColor, SeedPos, preset::Preset};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::preset::UnprocessedPreset;
 
-// const DST_FORCE: f32 = 0.2;
 pub fn init_image(sidelen: u32, source: Preset) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
     let imgpath = image::ImageBuffer::from_vec(
         source.inner.width,
@@ -144,13 +143,6 @@ impl CellBody {
 
         self.velx *= 0.97;
         self.vely *= 0.97;
-
-        // self.velx = self.velx.clamp(-MAX_VELOCITY, MAX_VELOCITY);
-        // self.vely = self.vely.clamp(-MAX_VELOCITY, MAX_VELOCITY);
-
-        // pos.xy[0] += self.velx;
-        // pos.xy[1] += self.vely;
-
         pos.xy[0] += self.velx.clamp(-MAX_VELOCITY, MAX_VELOCITY);
         pos.xy[1] += self.vely.clamp(-MAX_VELOCITY, MAX_VELOCITY);
 
@@ -185,8 +177,6 @@ impl CellBody {
             self.accx -= dx * weight;
             self.accy -= dy * weight;
         } else if dist.abs() < f32::EPSILON {
-            // if they are exactly on top of each other, push in a random direction
-            // deterministic pseudo-random push based on position
             let x_bits = pos.xy[0].to_bits();
             let y_bits = pos.xy[1].to_bits();
             let mut h = x_bits ^ y_bits.rotate_left(16) ^ 0x9E3779B9;
@@ -233,7 +223,6 @@ impl CellBody {
 }
 
 pub struct Sim {
-    //elapsed_frames: u32,
     pub cells: Vec<CellBody>,
     name: String,
 }
@@ -242,7 +231,6 @@ impl Sim {
     pub fn new(name: String) -> Self {
         Self {
             cells: Vec::new(),
-            //elapsed_frames: 0,
             name,
         }
     }
@@ -250,11 +238,6 @@ impl Sim {
     pub fn name(&self) -> String {
         self.name.clone()
     }
-
-    // pub fn source_path(&self) -> PathBuf {
-    //     self.source.clone()
-    // }
-
     pub fn switch(&mut self) {
         for cell in &mut self.cells {
             mem::swap(&mut cell.srcx, &mut cell.dstx);
@@ -266,8 +249,6 @@ impl Sim {
     pub fn update(&mut self, positions: &mut [SeedPos], sidelen: u32) {
         let grid_size = (self.cells.len() as f32).sqrt();
         let pixel_size = sidelen as f32 / grid_size;
-        //dbg!(grid_size, pixel_size);
-
         let mut grid = vec![vec![]; self.cells.len()];
 
         for (i, p) in positions.iter().enumerate() {
@@ -316,9 +297,7 @@ impl Sim {
                         );
 
                         if self.cells[i].stroke_id == self.cells[*other].stroke_id
-                        // && self.cells[i].stroke_id != 0
                         {
-                            // stronger attraction to same stroke
                             self.cells[i].apply_stroke_attraction(positions[i], other_cell, weight);
                         }
 
@@ -367,11 +346,3 @@ impl Sim {
         }
     }
 }
-
-// pub fn preset_path_to_name(source_dir: &Path) -> String {
-//     source_dir
-//         .file_stem()
-//         .unwrap()
-//         .to_string_lossy()
-//         .into_owned()
-// }
